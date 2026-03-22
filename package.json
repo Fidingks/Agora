@@ -1,0 +1,24 @@
+{
+  "name": "agora",
+  "version": "0.1.0",
+  "description": "A sandbox where AI agents negotiate, trade, and evolve their own coordination protocols",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/cli.ts",
+    "start": "tsx src/cli.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.80.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.0"
+  }
+}

@@ -1,0 +1,39 @@
+node_modules/
+dist/
+.env
+*.env.local
+.DS_Store
+Thumbs.db
+
+# TypeScript build output
+dist/
+build/
+*.js.map
+
+# Test coverage
+coverage/
+.vitest/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+desktop.ini
+
+# Claude Code internal
+.claude/
+
+# Agora runtime
+agora-results.tsv
+results.tsv
+runs/
+node_modules/
+package-lock.json
