@@ -42,6 +42,7 @@ import {
   type ProtocolConfig,
   type TradeOutcome,
 } from "./types.js";
+import { shouldAllowTrade, type ReputationStore } from "./reputation.js";
 
 // ---------------------------------------------------------------------------
 // Escrow protocol stages (internal)
@@ -86,13 +87,18 @@ function assertOk<T>(
 export class EscrowProtocol implements CoordinationProtocol {
   readonly name = "escrow-v1";
   readonly config: ProtocolConfig;
+  readonly reputationStore?: ReputationStore;
 
-  constructor(config: ProtocolConfig = DEFAULT_PROTOCOL_CONFIG) {
+  constructor(
+    config: ProtocolConfig = DEFAULT_PROTOCOL_CONFIG,
+    reputationStore?: ReputationStore,
+  ) {
     this.config = config;
+    this.reputationStore = reputationStore;
   }
 
   withConfig(overrides: Partial<ProtocolConfig>): EscrowProtocol {
-    return new EscrowProtocol({ ...this.config, ...overrides });
+    return new EscrowProtocol({ ...this.config, ...overrides }, this.reputationStore);
   }
 
   // ------------------------------------------------------------------
@@ -112,6 +118,47 @@ export class EscrowProtocol implements CoordinationProtocol {
       deliveryHash: null,
       startedAt: Date.now(),
     };
+
+    // Reputation gate: if a ReputationStore is present, check both agents
+    if (this.reputationStore) {
+      const minScore = this.config.minReputationScore;
+      if (!shouldAllowTrade(this.reputationStore, seller.id, minScore)) {
+        state.stage = "FAILED";
+        const rejectMsg = createMessage<RejectPayload>({
+          from: buyer.id,
+          to: seller.id,
+          type: MessageType.REJECT,
+          payload: { rejectedId: "", reason: "insufficient reputation" },
+        });
+        await seller.send(rejectMsg);
+        const durationMs = Date.now() - state.startedAt;
+        return {
+          result: "FAILED_NEGOTIATION",
+          price: undefined,
+          durationMs,
+          agentIds: [seller.id, buyer.id],
+          negotiationRounds: 0,
+        };
+      }
+      if (!shouldAllowTrade(this.reputationStore, buyer.id, minScore)) {
+        state.stage = "FAILED";
+        const rejectMsg = createMessage<RejectPayload>({
+          from: seller.id,
+          to: buyer.id,
+          type: MessageType.REJECT,
+          payload: { rejectedId: "", reason: "insufficient reputation" },
+        });
+        await buyer.send(rejectMsg);
+        const durationMs = Date.now() - state.startedAt;
+        return {
+          result: "FAILED_NEGOTIATION",
+          price: undefined,
+          durationMs,
+          agentIds: [seller.id, buyer.id],
+          negotiationRounds: 0,
+        };
+      }
+    }
 
     // Step 1: request an offer from the seller
     const offerRequest = createMessage<Record<string, never>>({
@@ -156,6 +203,21 @@ export class EscrowProtocol implements CoordinationProtocol {
     }
 
     const durationMs = Date.now() - state.startedAt;
+
+    // Update reputation based on outcome
+    if (this.reputationStore) {
+      if (state.stage === "SETTLED") {
+        this.reputationStore.recordSuccess(seller.id);
+        this.reputationStore.recordSuccess(buyer.id);
+      } else if (state.stage === "REFUNDED") {
+        // Seller failed to deliver or delivery was bad — seller is responsible
+        this.reputationStore.recordFailure(seller.id);
+      } else if (state.stage === "DISPUTED") {
+        // Disputed — both parties get a failure until resolved
+        this.reputationStore.recordFailure(seller.id);
+        this.reputationStore.recordFailure(buyer.id);
+      }
+    }
 
     return {
       result:

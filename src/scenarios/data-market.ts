@@ -30,6 +30,7 @@ import {
 import { EscrowProtocol } from "../protocols/escrow.js";
 import type { ProtocolConfig } from "../protocols/types.js";
 import { computeMetrics, type TradeOutcome } from "../protocols/types.js";
+import type { ReputationStore } from "../protocols/reputation.js";
 import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -282,6 +283,7 @@ export interface DataMarketConfig {
   seller: SellerConfig;
   buyer: BuyerConfig;
   protocol?: Partial<ProtocolConfig>;
+  reputationStore?: ReputationStore;
 }
 
 export interface DataMarketResult {
@@ -297,7 +299,7 @@ export async function runDataMarket(config: DataMarketConfig): Promise<DataMarke
   const seller = new SellerAgent(config.seller, ledger);
   const buyer = new BuyerAgent(config.buyer, ledger);
 
-  const protocol = new EscrowProtocol().withConfig(config.protocol ?? {});
+  const protocol = new EscrowProtocol(undefined, config.reputationStore).withConfig(config.protocol ?? {});
 
   const outcome = await protocol.run(
     { id: seller.id, send: (msg) => seller.receive(msg) },

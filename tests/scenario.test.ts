@@ -18,6 +18,7 @@ import {
   createDataItem,
   type DataMarketConfig,
 } from "../src/scenarios/data-market.js";
+import { ReputationStore } from "../src/protocols/reputation.js";
 
 // ---------------------------------------------------------------------------
 // Test 1: happy path — negotiation fires, settles at counter price
@@ -119,5 +120,169 @@ describe("Data Market: immediate accept (seller=10, budget=12)", () => {
     const result = await runDataMarket(IMMEDIATE_ACCEPT_CONFIG);
     expect(result.finalBalances.seller).toBe(10);
     expect(result.finalBalances.buyer).toBe(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reputation-gated trades
+// ---------------------------------------------------------------------------
+
+describe("reputation-gated trades", () => {
+  /**
+   * Since agent IDs are generated at runtime (timestamp-based), we need a
+   * two-pass approach for tests that pre-poison reputation:
+   *   1. Run a trade to discover the agent IDs (they're in outcome.agentIds).
+   *   2. Manipulate the store, then run again with the same store.
+   *
+   * But agents are recreated each call so IDs differ between runs.
+   * Instead, for gating tests we use the EscrowProtocol + Ledger directly
+   * so we control the agent IDs.
+   */
+
+  it("trade succeeds when both agents have sufficient reputation", async () => {
+    const store = new ReputationStore();
+    // New agents have 0.5 (Laplace prior). Threshold below that → pass.
+    const config: DataMarketConfig = {
+      ...DEFAULT_DATA_MARKET_CONFIG,
+      protocol: { minReputationScore: 0.4 },
+      reputationStore: store,
+    };
+    const result = await runDataMarket(config);
+    expect(result.outcome.result).toBe("SUCCESS");
+  });
+
+  it("trade is rejected when buyer has insufficient reputation", async () => {
+    const { Ledger } = await import("../src/core/ledger.js");
+    const { EscrowProtocol } = await import("../src/protocols/escrow.js");
+    const { SellerAgent, BuyerAgent, createDataItem: makeItem } = await import("../src/scenarios/data-market.js");
+
+    const store = new ReputationStore();
+    const ledger = new Ledger();
+    const item = makeItem("test", "test", "test-content");
+
+    const seller = new SellerAgent({ name: "GateSeller", initialBalance: 0, item, askPrice: 10, minAcceptRatio: 0.8 }, ledger);
+    const buyer = new BuyerAgent({ name: "GateBuyer", initialBalance: 20, budget: 12, firstCounterRatio: 0.8 }, ledger);
+
+    // Tank buyer reputation
+    for (let i = 0; i < 20; i++) store.recordFailure(buyer.id);
+    // buyer score ≈ 1/22 ≈ 0.045
+
+    const protocol = new EscrowProtocol({
+      maxNegotiationRounds: 5,
+      escrowTimeoutMs: 30_000,
+      minReputationScore: 0.4,
+      maxPriceDeviation: 0.3,
+    }, store);
+
+    const outcome = await protocol.run(
+      { id: seller.id, send: (msg) => seller.receive(msg) },
+      { id: buyer.id, send: (msg) => buyer.receive(msg) },
+      ledger,
+    );
+
+    expect(outcome.result).toBe("FAILED_NEGOTIATION");
+    expect(outcome.negotiationRounds).toBe(0);
+  });
+
+  it("trade is rejected when seller has insufficient reputation", async () => {
+    const { Ledger } = await import("../src/core/ledger.js");
+    const { EscrowProtocol } = await import("../src/protocols/escrow.js");
+    const { SellerAgent, BuyerAgent, createDataItem: makeItem } = await import("../src/scenarios/data-market.js");
+
+    const store = new ReputationStore();
+    const ledger = new Ledger();
+    const item = makeItem("test", "test", "test-content");
+
+    const seller = new SellerAgent({ name: "BadSeller", initialBalance: 0, item, askPrice: 10, minAcceptRatio: 0.8 }, ledger);
+    const buyer = new BuyerAgent({ name: "GoodBuyer", initialBalance: 20, budget: 12, firstCounterRatio: 0.8 }, ledger);
+
+    // Tank seller reputation
+    for (let i = 0; i < 20; i++) store.recordFailure(seller.id);
+
+    const protocol = new EscrowProtocol({
+      maxNegotiationRounds: 5,
+      escrowTimeoutMs: 30_000,
+      minReputationScore: 0.4,
+      maxPriceDeviation: 0.3,
+    }, store);
+
+    const outcome = await protocol.run(
+      { id: seller.id, send: (msg) => seller.receive(msg) },
+      { id: buyer.id, send: (msg) => buyer.receive(msg) },
+      ledger,
+    );
+
+    expect(outcome.result).toBe("FAILED_NEGOTIATION");
+    expect(outcome.negotiationRounds).toBe(0);
+  });
+
+  it("successful trade updates both agents' reputation scores", async () => {
+    const store = new ReputationStore();
+    const config: DataMarketConfig = {
+      ...DEFAULT_DATA_MARKET_CONFIG,
+      protocol: { minReputationScore: 0 },
+      reputationStore: store,
+    };
+    const result = await runDataMarket(config);
+    expect(result.outcome.result).toBe("SUCCESS");
+
+    // Extract agent IDs from outcome
+    const [sellerId, buyerId] = result.outcome.agentIds;
+
+    // After 1 success: score = (1+1)/(1+0+2) = 2/3 ≈ 0.667 (up from 0.5)
+    expect(store.getReputation(sellerId)).toBeCloseTo(2 / 3);
+    expect(store.getReputation(buyerId)).toBeCloseTo(2 / 3);
+  });
+
+  it("after a failed trade, the failing agent's reputation decreases", async () => {
+    const store = new ReputationStore();
+    const config: DataMarketConfig = {
+      ...HARD_NEGOTIATION_CONFIG,
+      protocol: { minReputationScore: 0 },
+      reputationStore: store,
+    };
+    const result = await runDataMarket(config);
+    expect(result.outcome.result).toBe("FAILED_NEGOTIATION");
+
+    // Pure negotiation failures (no escrow entered) don't change reputation.
+    // Both agents should still be at the default 0.5.
+    const [sellerId, buyerId] = result.outcome.agentIds;
+    expect(store.getReputation(sellerId)).toBeCloseTo(0.5);
+    expect(store.getReputation(buyerId)).toBeCloseTo(0.5);
+  });
+
+  it("with minReputationScore=0 (default), reputation gate is disabled — all trades proceed", async () => {
+    const { Ledger } = await import("../src/core/ledger.js");
+    const { EscrowProtocol } = await import("../src/protocols/escrow.js");
+    const { SellerAgent, BuyerAgent, createDataItem: makeItem } = await import("../src/scenarios/data-market.js");
+
+    const store = new ReputationStore();
+    const ledger = new Ledger();
+    const item = makeItem("test", "test", "test-content");
+
+    const seller = new SellerAgent({ name: "LowRepSeller", initialBalance: 0, item, askPrice: 10, minAcceptRatio: 0.8 }, ledger);
+    const buyer = new BuyerAgent({ name: "LowRepBuyer", initialBalance: 20, budget: 12, firstCounterRatio: 0.8 }, ledger);
+
+    // Tank both reputations
+    for (let i = 0; i < 50; i++) {
+      store.recordFailure(seller.id);
+      store.recordFailure(buyer.id);
+    }
+
+    // minReputationScore=0 means gate is disabled
+    const protocol = new EscrowProtocol({
+      maxNegotiationRounds: 5,
+      escrowTimeoutMs: 30_000,
+      minReputationScore: 0,
+      maxPriceDeviation: 0.3,
+    }, store);
+
+    const outcome = await protocol.run(
+      { id: seller.id, send: (msg) => seller.receive(msg) },
+      { id: buyer.id, send: (msg) => buyer.receive(msg) },
+      ledger,
+    );
+
+    expect(outcome.result).toBe("SUCCESS");
   });
 });
