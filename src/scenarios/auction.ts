@@ -51,14 +51,14 @@ function sha256(input: string): string {
 // Data item (same shape as in data-market.ts, inlined to avoid coupling)
 // ---------------------------------------------------------------------------
 
-interface AuctionItem {
+export interface AuctionItem {
   readonly id: string;
   readonly description: string;
   readonly content: string;
   readonly contentHash: string;
 }
 
-function createAuctionItem(id: string, description: string, content: string): AuctionItem {
+export function createAuctionItem(id: string, description: string, content: string): AuctionItem {
   return Object.freeze({ id, description, content, contentHash: sha256(content) });
 }
 

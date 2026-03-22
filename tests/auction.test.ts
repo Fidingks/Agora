@@ -14,7 +14,7 @@
  *   10. Auction metrics — verify AuctionOutcome fields
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   runAuction,
   DEFAULT_AUCTION_CONFIG,
@@ -22,6 +22,19 @@ import {
   type AuctionType,
 } from "../src/scenarios/auction.js";
 import { ReputationStore } from "../src/protocols/reputation.js";
+import {
+  LLMAuctionBidder,
+  BidDecisionSchema,
+  type LLMAuctionBidderConfig,
+} from "../src/agents/llm-auction-agent.js";
+import { runLLMAuction } from "../src/scenarios/llm-auction.js";
+import { Ledger } from "../src/core/ledger.js";
+import {
+  createMessage,
+  MessageType,
+  type MessageId,
+  type OfferPayload,
+} from "../src/core/message.js";
 
 // ---------------------------------------------------------------------------
 // 1. Happy path: 3 bidders, default config
@@ -659,5 +672,298 @@ describe("Backward compat: default auction is first-price", () => {
     expect(result.auctionType).toBe("first-price");
     expect(result.settlementPrice).toBeCloseTo(result.winningBid!);
     expect(result.tradeOutcome.price).toBeCloseTo(result.winningBid!);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 16. LLMAuctionBidder — mock mode (no API key): bid schema + bounds
+// ---------------------------------------------------------------------------
+
+describe("LLMAuctionBidder: mock mode bid is valid (no API key)", () => {
+  // Ensure the environment has NO API key so tests are deterministic.
+  const originalKey = process.env["ANTHROPIC_API_KEY"];
+
+  beforeEach(() => {
+    delete process.env["ANTHROPIC_API_KEY"];
+  });
+
+  afterEach(() => {
+    if (originalKey !== undefined) {
+      process.env["ANTHROPIC_API_KEY"] = originalKey;
+    }
+  });
+
+  it("BidDecisionSchema validates a correct bid object", () => {
+    const result = BidDecisionSchema.safeParse({ bid: 12.5, reasoning: "Test reasoning" });
+    expect(result.success).toBe(true);
+  });
+
+  it("BidDecisionSchema rejects a non-positive bid", () => {
+    const result = BidDecisionSchema.safeParse({ bid: -5, reasoning: "Bad bid" });
+    expect(result.success).toBe(false);
+  });
+
+  it("BidDecisionSchema rejects a missing reasoning field", () => {
+    const result = BidDecisionSchema.safeParse({ bid: 10 });
+    expect(result.success).toBe(false);
+  });
+
+  it("falls back to mock bid and responds to OFFER with COUNTER", async () => {
+    const ledger = new Ledger();
+    const cfg: LLMAuctionBidderConfig = {
+      name: "TestBidder",
+      budget: 20,
+      valuation: 15,
+      aggressiveness: 0.9,
+      auctionType: "first-price",
+      competitorCount: 2,
+    };
+    const bidder = new LLMAuctionBidder(cfg, ledger);
+
+    const offerMsg = createMessage<OfferPayload>({
+      from: "auctioneer-id" as any,
+      to: bidder.id,
+      type: MessageType.OFFER,
+      payload: { itemId: "item-1", itemDescription: "Test item", price: 8, currency: "CREDITS" },
+    });
+
+    const response = await bidder.receive(offerMsg);
+    // With valuation=15, aggressiveness=0.9, bid=13.5 > reserve=8 → COUNTER
+    expect(response).not.toBeNull();
+    expect(response!.type).toBe(MessageType.COUNTER);
+  });
+
+  it("bid is within [reserve, min(valuation, budget)] bounds in mock mode", async () => {
+    const ledger = new Ledger();
+    const cfg: LLMAuctionBidderConfig = {
+      name: "BoundsBidder",
+      budget: 20,
+      valuation: 14,
+      aggressiveness: 0.8,
+      auctionType: "first-price",
+      competitorCount: 1,
+    };
+    const bidder = new LLMAuctionBidder(cfg, ledger);
+    const reservePrice = 8;
+
+    const offerMsg = createMessage<OfferPayload>({
+      from: "auctioneer-id" as any,
+      to: bidder.id,
+      type: MessageType.OFFER,
+      payload: {
+        itemId: "item-1",
+        itemDescription: "Test item",
+        price: reservePrice,
+        currency: "CREDITS",
+      },
+    });
+
+    const response = await bidder.receive(offerMsg);
+    expect(response).not.toBeNull();
+    expect(response!.type).toBe(MessageType.COUNTER);
+
+    const counterPayload = response!.payload as { proposedPrice: number };
+    expect(counterPayload.proposedPrice).toBeGreaterThanOrEqual(reservePrice);
+    expect(counterPayload.proposedPrice).toBeLessThanOrEqual(
+      Math.min(cfg.valuation, cfg.budget),
+    );
+  });
+
+  it("passes when valuation is below reserve price", async () => {
+    const ledger = new Ledger();
+    const cfg: LLMAuctionBidderConfig = {
+      name: "PassBidder",
+      budget: 20,
+      valuation: 5, // below reserve
+      aggressiveness: 1.0,
+      auctionType: "first-price",
+      competitorCount: 1,
+    };
+    const bidder = new LLMAuctionBidder(cfg, ledger);
+    const reservePrice = 10;
+
+    const offerMsg = createMessage<OfferPayload>({
+      from: "auctioneer-id" as any,
+      to: bidder.id,
+      type: MessageType.OFFER,
+      payload: {
+        itemId: "item-1",
+        itemDescription: "Test item",
+        price: reservePrice,
+        currency: "CREDITS",
+      },
+    });
+
+    const response = await bidder.receive(offerMsg);
+    // valuation(5) < reserve(10) → REJECT
+    expect(response).not.toBeNull();
+    expect(response!.type).toBe(MessageType.REJECT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 17. LLMAuctionBidder — strategy framing (mock mode, verified via auctionType)
+// ---------------------------------------------------------------------------
+
+describe("LLMAuctionBidder: strategy framing (mock mode)", () => {
+  const originalKey = process.env["ANTHROPIC_API_KEY"];
+
+  beforeEach(() => {
+    delete process.env["ANTHROPIC_API_KEY"];
+  });
+
+  afterEach(() => {
+    if (originalKey !== undefined) {
+      process.env["ANTHROPIC_API_KEY"] = originalKey;
+    }
+  });
+
+  it("auctionType getter returns the configured type (first-price)", () => {
+    const ledger = new Ledger();
+    const bidder = new LLMAuctionBidder(
+      { name: "B", budget: 20, valuation: 15, auctionType: "first-price", competitorCount: 2 },
+      ledger,
+    );
+    expect(bidder.auctionType).toBe("first-price");
+  });
+
+  it("auctionType getter returns the configured type (vickrey)", () => {
+    const ledger = new Ledger();
+    const bidder = new LLMAuctionBidder(
+      { name: "B", budget: 20, valuation: 15, auctionType: "vickrey", competitorCount: 2 },
+      ledger,
+    );
+    expect(bidder.auctionType).toBe("vickrey");
+  });
+
+  it("Vickrey bidder uses aggressiveness=1.0 (bids true value in mock)", async () => {
+    const ledger = new Ledger();
+    const cfg: LLMAuctionBidderConfig = {
+      name: "VickreyBidder",
+      budget: 30,
+      valuation: 20,
+      aggressiveness: 1.0, // Vickrey dominant strategy: bid true value
+      auctionType: "vickrey",
+      competitorCount: 2,
+    };
+    const bidder = new LLMAuctionBidder(cfg, ledger);
+
+    const offerMsg = createMessage<OfferPayload>({
+      from: "auctioneer-id" as any,
+      to: bidder.id,
+      type: MessageType.OFFER,
+      payload: { itemId: "item-1", itemDescription: "Test", price: 10, currency: "CREDITS" },
+    });
+
+    const response = await bidder.receive(offerMsg);
+    expect(response!.type).toBe(MessageType.COUNTER);
+    const counterPayload = response!.payload as { proposedPrice: number };
+    // With aggressiveness=1.0, mock bid = valuation*1.0 = 20
+    expect(counterPayload.proposedPrice).toBeCloseTo(20);
+  });
+
+  it("first-price bidder with aggressiveness=0.8 shades bid below valuation", async () => {
+    const ledger = new Ledger();
+    const cfg: LLMAuctionBidderConfig = {
+      name: "FirstPriceBidder",
+      budget: 30,
+      valuation: 20,
+      aggressiveness: 0.8, // bid shaded to 16 (below valuation 20)
+      auctionType: "first-price",
+      competitorCount: 2,
+    };
+    const bidder = new LLMAuctionBidder(cfg, ledger);
+
+    const offerMsg = createMessage<OfferPayload>({
+      from: "auctioneer-id" as any,
+      to: bidder.id,
+      type: MessageType.OFFER,
+      payload: { itemId: "item-1", itemDescription: "Test", price: 10, currency: "CREDITS" },
+    });
+
+    const response = await bidder.receive(offerMsg);
+    expect(response!.type).toBe(MessageType.COUNTER);
+    const counterPayload = response!.payload as { proposedPrice: number };
+    // mock bid = 20 * 0.8 = 16 < 20 (shaded below valuation)
+    expect(counterPayload.proposedPrice).toBeLessThan(cfg.valuation);
+    expect(counterPayload.proposedPrice).toBeCloseTo(16);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 18. runLLMAuction — full scenario runs to completion (mock mode)
+// ---------------------------------------------------------------------------
+
+describe("runLLMAuction: full scenario (mock mode)", () => {
+  const originalKey = process.env["ANTHROPIC_API_KEY"];
+
+  beforeEach(() => {
+    delete process.env["ANTHROPIC_API_KEY"];
+  });
+
+  afterEach(() => {
+    if (originalKey !== undefined) {
+      process.env["ANTHROPIC_API_KEY"] = originalKey;
+    }
+  });
+
+  it("default first-price LLM auction produces SUCCESS", async () => {
+    const result = await runLLMAuction();
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("returns a bidderReasoning map with entries for all bidders", async () => {
+    const result = await runLLMAuction({ bidderCount: 3 });
+    expect(Object.keys(result.bidderReasoning).length).toBe(3);
+  });
+
+  it("bidderReasoning values are non-empty strings (mock label present)", async () => {
+    const result = await runLLMAuction({ bidderCount: 2 });
+    for (const reasoning of Object.values(result.bidderReasoning)) {
+      // In mock mode the reasoning contains "[mock]"
+      expect(reasoning.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("vickrey LLM auction reports correct auctionType", async () => {
+    const result = await runLLMAuction({ auctionType: "vickrey" });
+    expect(result.auctionType).toBe("vickrey");
+  });
+
+  it("LLM auction winner ID is not null on success", async () => {
+    const result = await runLLMAuction();
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.winnerId).not.toBeNull();
+  });
+
+  it("vickrey LLM auction settlementPrice <= winningBid", async () => {
+    const result = await runLLMAuction({ auctionType: "vickrey", bidderCount: 3 });
+    if (result.tradeOutcome.result === "SUCCESS") {
+      expect(result.settlementPrice).not.toBeNull();
+      expect(result.settlementPrice!).toBeLessThanOrEqual(result.winningBid!);
+    }
+  });
+
+  it("first-price LLM auction settlementPrice equals winningBid", async () => {
+    const result = await runLLMAuction({ auctionType: "first-price" });
+    if (result.tradeOutcome.result === "SUCCESS") {
+      expect(result.settlementPrice).toBeCloseTo(result.winningBid!);
+    }
+  });
+
+  it("totalBidders matches the configured bidder count", async () => {
+    const result = await runLLMAuction({ bidderCount: 4 });
+    expect(result.totalBidders).toBe(4);
+  });
+
+  it("durationMs is non-negative", async () => {
+    const result = await runLLMAuction();
+    expect(result.tradeOutcome.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("LLM auction includes auctioneer + bidders in agentIds", async () => {
+    const result = await runLLMAuction({ bidderCount: 3 });
+    // 1 auctioneer + 3 bidders = 4
+    expect(result.tradeOutcome.agentIds).toHaveLength(4);
   });
 });
