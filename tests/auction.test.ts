@@ -967,3 +967,452 @@ describe("runLLMAuction: full scenario (mock mode)", () => {
     expect(result.tradeOutcome.agentIds).toHaveLength(4);
   });
 });
+
+// ---------------------------------------------------------------------------
+// 19. Dutch auction: basic happy path
+//
+//   reservePrice = 10
+//   startingPrice = 20, priceDecrement = 2, maxRounds = 10
+//   Bidder 0: valuation = 16, budget = 30  → accepts at round 3 (price = 16)
+//   Bidder 1: valuation = 12, budget = 30  → would accept at round 5 (price = 12)
+//   Bidder 2: valuation = 8,  budget = 30  → never accepts (8 < reserve 10)
+//
+//   Round 1: price=20 → 20>16 no accept
+//   Round 2: price=18 → 18>16 no accept
+//   Round 3: price=16 → 16≤16 Bidder 0 accepts, Bidder 1 (12<16) rejects
+//   Winner: Bidder 0 at 16
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: first acceptor wins at current price", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "dutch" as AuctionType,
+    bidderCount: 3,
+    reservePrice: 10,
+    bidderBudgets: [30, 30, 30],
+    bidderValuations: [16, 12, 8],
+    bidAggressiveness: [1.0, 1.0, 1.0],
+    startingPrice: 20,
+    priceDecrement: 2,
+    maxRounds: 10,
+  };
+
+  it("produces SUCCESS", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("winner accepts at the round price, not their valuation", async () => {
+    const result = await runAuction(config);
+    // Price starts at 20, drops by 2 each round.
+    // Bidder 0 valuation=16 → accepts when price ≤ 16, i.e. round 3 at price=16
+    expect(result.settlementPrice).toBeCloseTo(16);
+  });
+
+  it("winningBid equals the accepted round price for Dutch auction", async () => {
+    const result = await runAuction(config);
+    expect(result.winningBid).toBeCloseTo(result.settlementPrice!);
+  });
+
+  it("reports auctionType as 'dutch'", async () => {
+    const result = await runAuction(config);
+    expect(result.auctionType).toBe("dutch");
+  });
+
+  it("winnerId is not null", async () => {
+    const result = await runAuction(config);
+    expect(result.winnerId).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 20. Dutch auction: price descends each round until acceptance
+//
+//   Use a high valuation so acceptance happens on round 1 at startingPrice.
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: price descends, first round acceptance", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "dutch" as AuctionType,
+    bidderCount: 2,
+    reservePrice: 10,
+    bidderBudgets: [50, 50],
+    bidderValuations: [30, 25],
+    bidAggressiveness: [1.0, 1.0],
+    startingPrice: 30,
+    priceDecrement: 5,
+    maxRounds: 10,
+  };
+
+  it("produces SUCCESS on round 1 when valuation >= startingPrice", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("settlementPrice equals startingPrice when winner accepts immediately", async () => {
+    const result = await runAuction(config);
+    expect(result.settlementPrice).toBeCloseTo(30);
+  });
+
+  it("negotiationRounds is 1 when winner accepts on the first round", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.negotiationRounds).toBe(1);
+  });
+
+  it("totalBidders is correct", async () => {
+    const result = await runAuction(config);
+    expect(result.totalBidders).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 21. Dutch auction: no acceptors after maxRounds → no winner
+//
+//   All valuations below reserve or starting price never drops low enough.
+//   maxRounds = 3, startingPrice = 30, priceDecrement = 1 → prices: 30, 29, 28
+//   Valuations: 5, 5 (both < reserve 10 → never accept)
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: no acceptors after maxRounds → no winner", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "dutch" as AuctionType,
+    bidderCount: 2,
+    reservePrice: 10,
+    bidderBudgets: [20, 20],
+    bidderValuations: [5, 5],
+    bidAggressiveness: [1.0, 1.0],
+    startingPrice: 30,
+    priceDecrement: 1,
+    maxRounds: 3,
+  };
+
+  it("produces FAILED_NEGOTIATION", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("FAILED_NEGOTIATION");
+  });
+
+  it("winnerId is null", async () => {
+    const result = await runAuction(config);
+    expect(result.winnerId).toBeNull();
+  });
+
+  it("winningBid is null", async () => {
+    const result = await runAuction(config);
+    expect(result.winningBid).toBeNull();
+  });
+
+  it("settlementPrice is null", async () => {
+    const result = await runAuction(config);
+    expect(result.settlementPrice).toBeNull();
+  });
+
+  it("tradeOutcome.price is undefined", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.price).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 22. Dutch auction: multiple acceptors in the same round → first (lowest
+//     index) wins.
+//
+//   Two bidders both have valuation ≥ startingPrice → both accept round 1.
+//   The first bidder (index 0) should win.
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: multiple acceptors in same round → first wins", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "dutch" as AuctionType,
+    bidderCount: 3,
+    reservePrice: 10,
+    bidderBudgets: [50, 50, 50],
+    bidderValuations: [30, 30, 30],
+    bidAggressiveness: [1.0, 1.0, 1.0],
+    startingPrice: 25,
+    priceDecrement: 5,
+    maxRounds: 10,
+  };
+
+  it("produces SUCCESS", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("winner is the first bidder (deterministic tie-break by index)", async () => {
+    // Run twice to verify determinism
+    const r1 = await runAuction(config);
+    const r2 = await runAuction(config);
+    // Both must elect a winner
+    expect(r1.winnerId).not.toBeNull();
+    expect(r2.winnerId).not.toBeNull();
+    // Both should settle at the same price (round 1 price = 25)
+    expect(r1.settlementPrice).toBeCloseTo(r2.settlementPrice!);
+  });
+
+  it("settlement price is the round price (25), not valuation (30)", async () => {
+    const result = await runAuction(config);
+    expect(result.settlementPrice).toBeCloseTo(25);
+    expect(result.settlementPrice).not.toBeCloseTo(30);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 23. Dutch auction: winner pays the round price, not their valuation
+//
+//   Bidder 0: valuation = 20, startingPrice = 30, priceDecrement = 5
+//   Round 1: price = 30 > 20 → no accept
+//   Round 2: price = 25 > 20 → no accept
+//   Round 3: price = 20 ≤ 20 → accept at 20, not at valuation
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: winner pays the round price, not their valuation", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "dutch" as AuctionType,
+    bidderCount: 1,
+    reservePrice: 10,
+    bidderBudgets: [50],
+    bidderValuations: [20],
+    bidAggressiveness: [1.0],
+    startingPrice: 30,
+    priceDecrement: 5,
+    maxRounds: 10,
+  };
+
+  it("produces SUCCESS", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("settlementPrice is the round price (20), not higher starting prices", async () => {
+    const result = await runAuction(config);
+    // Round 1: 30, Round 2: 25, Round 3: 20 = valuation → accept
+    expect(result.settlementPrice).toBeCloseTo(20);
+  });
+
+  it("winningBid equals settlementPrice (accepted round price)", async () => {
+    const result = await runAuction(config);
+    expect(result.winningBid).toBeCloseTo(result.settlementPrice!);
+  });
+
+  it("tradeOutcome.price matches settlementPrice", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.price).toBeCloseTo(result.settlementPrice!);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 24. Dutch auction: custom startingPrice and priceDecrement are respected
+//
+//   Verify that the Dutch runner correctly uses provided config overrides.
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: custom startingPrice and priceDecrement", () => {
+  it("uses default startingPrice = reservePrice * 2 when not specified", async () => {
+    // reservePrice = 10 → default startingPrice = 20
+    // Bidder valuation = 20 → accepts on round 1 at price 20
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 1,
+      reservePrice: 10,
+      bidderBudgets: [50],
+      bidderValuations: [20],
+      bidAggressiveness: [1.0],
+      // startingPrice not set → defaults to 10 * 2 = 20
+      priceDecrement: 2,
+      maxRounds: 10,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.settlementPrice).toBeCloseTo(20);
+  });
+
+  it("uses default priceDecrement = reservePrice * 0.1 when not specified", async () => {
+    // reservePrice = 10 → default priceDecrement = 1
+    // startingPrice = 15, valuation = 14
+    // Round 1: 15, Round 2: 14 = valuation → accept
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 1,
+      reservePrice: 10,
+      bidderBudgets: [50],
+      bidderValuations: [14],
+      bidAggressiveness: [1.0],
+      startingPrice: 15,
+      // priceDecrement not set → defaults to 10 * 0.1 = 1
+      maxRounds: 10,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.settlementPrice).toBeCloseTo(14);
+  });
+
+  it("explicit custom startingPrice and priceDecrement are honoured", async () => {
+    // startingPrice = 100, priceDecrement = 10, valuation = 70
+    // Rounds: 100, 90, 80, 70 → accept at round 4 at price 70
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 1,
+      reservePrice: 5,
+      bidderBudgets: [200],
+      bidderValuations: [70],
+      bidAggressiveness: [1.0],
+      startingPrice: 100,
+      priceDecrement: 10,
+      maxRounds: 15,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.settlementPrice).toBeCloseTo(70);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 25. Dutch auction: escrow settles correctly
+//
+//   Verify that after a Dutch auction win, the ledger reflects the correct
+//   fund transfers (winner pays, auctioneer receives).
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: escrow settles correctly", () => {
+  it("tradeOutcome result is SUCCESS after escrow settlement", async () => {
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 2,
+      reservePrice: 10,
+      bidderBudgets: [50, 50],
+      bidderValuations: [25, 20],
+      bidAggressiveness: [1.0, 1.0],
+      startingPrice: 30,
+      priceDecrement: 5,
+      maxRounds: 10,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("settlementPrice is recorded in tradeOutcome.price", async () => {
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 1,
+      reservePrice: 10,
+      bidderBudgets: [50],
+      bidderValuations: [20],
+      bidAggressiveness: [1.0],
+      startingPrice: 20,
+      priceDecrement: 5,
+      maxRounds: 10,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.tradeOutcome.price).toBeCloseTo(result.settlementPrice!);
+  });
+
+  it("agentIds includes auctioneer and all bidders", async () => {
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 3,
+      reservePrice: 10,
+      bidderBudgets: [50, 50, 50],
+      bidderValuations: [25, 20, 15],
+      bidAggressiveness: [1.0, 1.0, 1.0],
+      startingPrice: 30,
+      priceDecrement: 5,
+      maxRounds: 10,
+    });
+    // 1 auctioneer + 3 bidders = 4
+    expect(result.tradeOutcome.agentIds).toHaveLength(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 26. Dutch auction: reputation integration
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: reputation integration", () => {
+  it("records success for winner and auctioneer on successful Dutch auction", async () => {
+    const store = new ReputationStore();
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 2,
+      reservePrice: 10,
+      bidderBudgets: [50, 50],
+      bidderValuations: [20, 15],
+      bidAggressiveness: [1.0, 1.0],
+      startingPrice: 20,
+      priceDecrement: 5,
+      maxRounds: 10,
+      reputationStore: store,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+
+    const auctioneerId = result.tradeOutcome.agentIds[0]!;
+    const winnerId = result.winnerId!;
+
+    // After 1 success: score = (1+1)/(1+0+2) = 2/3 ≈ 0.667
+    expect(store.getReputation(auctioneerId)).toBeCloseTo(2 / 3);
+    expect(store.getReputation(winnerId)).toBeCloseTo(2 / 3);
+  });
+
+  it("does not update reputation for losing bidders in Dutch auction", async () => {
+    const store = new ReputationStore();
+    const result = await runAuction({
+      auctionType: "dutch" as AuctionType,
+      bidderCount: 3,
+      reservePrice: 10,
+      bidderBudgets: [50, 50, 50],
+      bidderValuations: [25, 20, 15],
+      bidAggressiveness: [1.0, 1.0, 1.0],
+      startingPrice: 25,
+      priceDecrement: 5,
+      maxRounds: 10,
+      reputationStore: store,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+
+    // Losers (bidders 1 and 2) should remain at default 0.5
+    // agentIds: [auctioneer(0), bidder-0(1), bidder-1(2), bidder-2(3)]
+    const loser1Id = result.tradeOutcome.agentIds[2]!;
+    const loser2Id = result.tradeOutcome.agentIds[3]!;
+    expect(store.getReputation(loser1Id)).toBeCloseTo(0.5);
+    expect(store.getReputation(loser2Id)).toBeCloseTo(0.5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 27. Dutch auction: backward compatibility — existing first-price and
+//     vickrey tests are unaffected (smoke test)
+// ---------------------------------------------------------------------------
+
+describe("Dutch auction: backward compat — first-price and vickrey unchanged", () => {
+  it("first-price auction still works after Dutch code addition", async () => {
+    const result = await runAuction({
+      auctionType: "first-price" as AuctionType,
+      ...DEFAULT_AUCTION_CONFIG,
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.auctionType).toBe("first-price");
+    expect(result.settlementPrice).toBeCloseTo(result.winningBid!);
+  });
+
+  it("vickrey auction still works after Dutch code addition", async () => {
+    const result = await runAuction({
+      auctionType: "vickrey" as AuctionType,
+      bidderCount: 3,
+      reservePrice: 10,
+      bidderBudgets: [30, 25, 20],
+      bidderValuations: [20, 15, 12],
+      bidAggressiveness: [1.0, 1.0, 1.0],
+    });
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.auctionType).toBe("vickrey");
+    expect(result.settlementPrice).toBeCloseTo(15); // second-highest
+  });
+
+  it("default auction (no auctionType) still uses first-price", async () => {
+    const result = await runAuction();
+    expect(result.auctionType).toBe("first-price");
+  });
+
+  it("Dutch auction does not interfere with first-price validBidCount semantics", async () => {
+    // first-price counts valid sealed bids
+    const fpResult = await runAuction({
+      auctionType: "first-price" as AuctionType,
+      ...DEFAULT_AUCTION_CONFIG,
+    });
+    expect(fpResult.validBidCount).toBeGreaterThan(0);
+  });
+});

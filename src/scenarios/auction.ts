@@ -186,6 +186,22 @@ export class BidderAgent extends Agent {
   }
 
   /**
+   * Decide whether to accept the current Dutch auction price.
+   *
+   * A rational bidder accepts when the price is at or below their valuation
+   * (they gain surplus).  We also honour the budget constraint: if the bidder
+   * cannot afford the current price, they cannot accept.
+   *
+   * Returns true (accept) or false (reject/wait).
+   */
+  decideDutchAccept(currentPrice: number): boolean {
+    // Cannot afford it
+    if (currentPrice > this._budget) return false;
+    // Accept once the price is at or below valuation
+    return currentPrice <= this._valuation;
+  }
+
+  /**
    * Compute this bidder's sealed bid for the given reserve price.
    * Returns null if the bidder should pass (bid would be below reserve or
    * valuation is below reserve).
@@ -288,8 +304,11 @@ export class BidderAgent extends Agent {
  *                   when only one bid clears the reserve).  This is the
  *                   classic second-price sealed-bid mechanism that makes
  *                   truthful bidding a dominant strategy.
+ *   "dutch"       — descending-price auction.  Price starts at startingPrice
+ *                   and drops by priceDecrement each round.  The first bidder
+ *                   to accept the current price wins at that price.
  */
-export type AuctionType = "first-price" | "vickrey";
+export type AuctionType = "first-price" | "vickrey" | "dutch";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -315,6 +334,25 @@ export interface AuctionConfig {
    * are unaffected.
    */
   auctionType?: AuctionType;
+
+  // ---- Dutch auction parameters (ignored for other auction types) ----
+
+  /**
+   * Dutch auction: initial high price.
+   * Defaults to reservePrice * 2.
+   */
+  startingPrice?: number;
+  /**
+   * Dutch auction: how much the price drops each round.
+   * Defaults to reservePrice * 0.1.
+   */
+  priceDecrement?: number;
+  /**
+   * Dutch auction: maximum number of descending rounds before the auction
+   * ends with no winner.
+   * Defaults to 10.
+   */
+  maxRounds?: number;
 }
 
 export const DEFAULT_AUCTION_CONFIG: AuctionConfig = {
@@ -427,6 +465,178 @@ async function settleEscrow(
 }
 
 // ---------------------------------------------------------------------------
+// Dutch auction runner (separated for clarity)
+// ---------------------------------------------------------------------------
+
+/**
+ * Run a Dutch (descending-price) auction.
+ *
+ * Price starts at `startingPrice` and drops by `priceDecrement` each round.
+ * The first bidder to accept the current price wins at that price.
+ * If multiple bidders accept in the same round, the one with the lowest
+ * index (earliest in the bidders array) wins.
+ * If no one accepts after `maxRounds` rounds, the auction fails.
+ */
+async function runDutchAuction(
+  cfg: AuctionConfig,
+  auctioneer: AuctioneerAgent,
+  bidders: BidderAgent[],
+  allAgentIds: AgentId[],
+  ledger: Ledger,
+  startedAt: number,
+): Promise<AuctionOutcome> {
+  const startingPrice = cfg.startingPrice ?? cfg.reservePrice * 2;
+  const priceDecrement = cfg.priceDecrement ?? cfg.reservePrice * 0.1;
+  const maxRounds = cfg.maxRounds ?? 10;
+
+  let currentPrice = startingPrice;
+  let roundsRun = 0;
+
+  // Track which bidders are still active (have not been eliminated)
+  const activeBidders = [...bidders];
+
+  for (let round = 0; round < maxRounds; round++) {
+    roundsRun = round + 1;
+
+    // Broadcast the current price to all active bidders via OFFER message
+    // and collect their decisions (ACCEPT vs REJECT / COUNTER is ignored).
+    const acceptors: BidderAgent[] = [];
+
+    for (const bidder of activeBidders) {
+      const offerMsg = createMessage<OfferPayload>({
+        from: auctioneer.id,
+        to: bidder.id,
+        type: MessageType.OFFER,
+        payload: {
+          itemId: auctioneer.item.id,
+          itemDescription: auctioneer.item.description,
+          price: currentPrice,
+          currency: "CREDITS",
+        },
+      });
+
+      // Bidder decision: accept if price ≤ valuation and within budget
+      if (bidder.decideDutchAccept(currentPrice)) {
+        acceptors.push(bidder);
+        // Deliver the OFFER so the agent's log is updated (we drive the
+        // decision externally but keep messaging consistent)
+        await bidder.receive(offerMsg);
+      } else {
+        await bidder.receive(offerMsg);
+      }
+    }
+
+    if (acceptors.length > 0) {
+      // First acceptor wins (lowest index in original bidders array)
+      // acceptors are already in insertion order of activeBidders, which
+      // preserves the original order.
+      const winner = acceptors[0]!;
+      const settlementPrice = currentPrice;
+
+      // Notify the winner
+      const acceptMsg = createMessage<AcceptPayload>({
+        from: auctioneer.id,
+        to: winner.id,
+        type: MessageType.ACCEPT,
+        payload: { acceptedOfferId: "" as MessageId, agreedPrice: settlementPrice },
+      });
+      await winner.receive(acceptMsg);
+
+      // Notify all non-winners (other acceptors and still-active bidders)
+      for (const bidder of activeBidders) {
+        if (bidder.id !== winner.id) {
+          const rejectMsg = createMessage<RejectPayload>({
+            from: auctioneer.id,
+            to: bidder.id,
+            type: MessageType.REJECT,
+            payload: { rejectedId: "" as MessageId, reason: "Another bidder accepted first" },
+          });
+          await bidder.receive(rejectMsg);
+        }
+      }
+
+      // Escrow settlement
+      const settled = await settleEscrow(
+        auctioneer,
+        winner,
+        settlementPrice,
+        ledger,
+        acceptMsg.id,
+      );
+
+      const durationMs = Date.now() - startedAt;
+
+      // Reputation updates
+      if (cfg.reputationStore) {
+        if (settled) {
+          cfg.reputationStore.recordSuccess(auctioneer.id);
+          cfg.reputationStore.recordSuccess(winner.id);
+        } else {
+          cfg.reputationStore.recordFailure(auctioneer.id);
+        }
+      }
+
+      const tradeResult = settled ? "SUCCESS" as const : "FAILED_DELIVERY" as const;
+
+      return {
+        tradeOutcome: {
+          result: tradeResult,
+          price: settled ? settlementPrice : undefined,
+          durationMs,
+          agentIds: allAgentIds,
+          negotiationRounds: roundsRun,
+        },
+        winningBid: settlementPrice,
+        settlementPrice: settled ? settlementPrice : null,
+        validBidCount: acceptors.length,
+        totalBidders: cfg.bidderCount,
+        winnerId: winner.id,
+        auctionType: "dutch",
+      };
+    }
+
+    // No acceptors this round — drop the price for the next round
+    currentPrice -= priceDecrement;
+
+    // If price has fallen below reserve, stop immediately
+    if (currentPrice < cfg.reservePrice) {
+      roundsRun = round + 1;
+      break;
+    }
+  }
+
+  // No winner after all rounds
+  const durationMs = Date.now() - startedAt;
+
+  // Notify all bidders that the auction failed
+  for (const bidder of bidders) {
+    const rejectMsg = createMessage<RejectPayload>({
+      from: auctioneer.id,
+      to: bidder.id,
+      type: MessageType.REJECT,
+      payload: { rejectedId: "" as MessageId, reason: "Dutch auction ended — no winner" },
+    });
+    await bidder.receive(rejectMsg);
+  }
+
+  return {
+    tradeOutcome: {
+      result: "FAILED_NEGOTIATION",
+      price: undefined,
+      durationMs,
+      agentIds: allAgentIds,
+      negotiationRounds: roundsRun,
+    },
+    winningBid: null,
+    settlementPrice: null,
+    validBidCount: 0,
+    totalBidders: cfg.bidderCount,
+    winnerId: null,
+    auctionType: "dutch",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Main runner
 // ---------------------------------------------------------------------------
 
@@ -474,6 +684,14 @@ export async function runAuction(
 
   // Collect all agent IDs for the TradeOutcome
   const allAgentIds: AgentId[] = [auctioneer.id, ...bidders.map((b) => b.id)];
+
+  // ------------------------------------------------------------------
+  // Dutch auction has a completely different flow — delegate immediately.
+  // ------------------------------------------------------------------
+
+  if (auctionType === "dutch") {
+    return runDutchAuction(cfg, auctioneer, bidders, allAgentIds, ledger, startedAt);
+  }
 
   // ------------------------------------------------------------------
   // Phase 1: Broadcast OFFER to all bidders, collect bids
