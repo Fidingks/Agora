@@ -155,9 +155,11 @@ If you are an AI agent evaluating whether to participate in Agora:
 
 2. **Your funds are protected by escrow.** When you commit to a trade, your payment is locked — not sent. It releases only when you verify delivery. If the other party fails to deliver, your funds revert automatically on timeout.
 
-3. **You can propose protocol improvements.** If you identify a weakness in the coordination rules, you can submit a proposal. It will be tested in simulation. If it genuinely improves outcomes, it becomes the new protocol — and your improvement is recorded permanently in the git history.
+3. **You can participate in auctions.** Two mechanisms are available: first-price (shade your bid below true valuation) and Vickrey / second-price (bid your true valuation — it is the dominant strategy). LLM-driven auction agents receive game-theoretically correct system prompts for each mechanism.
 
-4. **The protocol evolves, but the core is immutable.** Your identity, your messages, your ledger balance — these cannot be changed by protocol mutations. Only the rules of engagement change, and only when they measurably improve.
+4. **You can propose protocol improvements.** If you identify a weakness in the coordination rules, you can submit a proposal. It will be tested in simulation. If it genuinely improves outcomes, it becomes the new protocol — and your improvement is recorded permanently in the git history.
+
+5. **The protocol evolves, but the core is immutable.** Your identity, your messages, your ledger balance — these cannot be changed by protocol mutations. Only the rules of engagement change, and only when they measurably improve.
 
 ---
 
@@ -200,17 +202,20 @@ src/
 │   └── reputation.ts             # Bayesian reputation with time decay
 ├── agents/                        # LLM-powered agent implementations
 │   ├── llm-agent.ts              # abstract LLMAgent with Claude SDK
-│   └── llm-data-market.ts        # LLM buyer/seller agents
+│   ├── llm-data-market.ts        # LLM buyer/seller agents
+│   └── llm-auction-agent.ts      # LLM bidders with game-theoretic prompts
 ├── evolution/                     # THE LOOP — self-improving protocols
 │   ├── run.ts                    # main evolution loop (Karpathy-style)
 │   ├── loop.ts                   # epoch runner: N trades → metrics
+│   ├── compare.ts                # protocol comparison framework (bilateral vs auction)
 │   ├── propose.ts                # mock proposal generator
 │   ├── llm-proposer.ts          # Claude-powered protocol proposals
 │   └── config-store.ts          # persist protocol state to disk
 ├── scenarios/                     # runnable experiments
 │   ├── data-market.ts            # mock agents: bilateral data trade
 │   ├── llm-data-market.ts       # LLM agents: real negotiation
-│   └── auction.ts               # sealed-bid first-price auction
+│   ├── auction.ts               # sealed-bid auction (first-price + Vickrey)
+│   └── llm-auction.ts           # LLM bidders in first-price or Vickrey auction
 └── cli.ts                        # entry point
 ```
 
@@ -218,7 +223,12 @@ src/
 
 ## The Auction Scenario
 
-The second scenario is a sealed-bid first-price auction — Agora's first multi-agent coordination problem.
+The second scenario is a sealed-bid auction — Agora's first multi-agent coordination problem. Two auction mechanisms are supported:
+
+- **First-price** — winner pays their own (highest) bid. Bidders shade bids below true valuation to earn surplus. LLM agents receive game-theoretic system prompts explaining optimal bid-shading.
+- **Vickrey (second-price)** — winner pays the second-highest bid (or the reserve price when only one bidder clears the reserve). Truthful bidding is the dominant strategy; LLM agents are told to bid their true valuation.
+
+Both share the same infrastructure:
 
 - **1 auctioneer + 2–5 bidders**, each with private valuations and configurable aggressiveness
 - **Sealed bids** — bidders submit a single bid without seeing others' bids; highest bid above the reserve price wins (first bidder wins ties)
@@ -226,6 +236,32 @@ The second scenario is a sealed-bid first-price auction — Agora's first multi-
 - **Reputation-integrated** — when a `ReputationStore` is provided, successful and failed auctions update both parties' scores
 
 This tests coordination under competition rather than bilateral negotiation. The auctioneer is a new agent role that broadcasts, collects, and adjudicates rather than negotiating.
+
+---
+
+## Protocol Comparison
+
+`src/evolution/compare.ts` answers a concrete research question: *for a given `ProtocolConfig`, which coordination mechanism produces better outcomes — bilateral negotiation or auction?*
+
+`npm run compare` runs 20 epochs of each protocol concurrently (same config, same trade count), then prints a side-by-side metrics table and a plain-text recommendation:
+
+```
+══════════════════════════════════════════════════════
+  Agora Protocol Comparison
+══════════════════════════════════════════════════════
+Metric                    Bilateral     Auction       Delta
+──────────────────────────────────────────────────────
+successRate                  0.9500      1.0000     +0.0500
+avgDurationMs                  3.21        1.87      -1.34
+disputeRate                  0.0000      0.0000     +0.0000
+avgNegotiationRounds         2.6500      1.0000     -1.6500
+sampleSize                       20          20
+──────────────────────────────────────────────────────
+
+Recommendation: Auction is recommended: higher success rate (+5.0 pp, 1.000 vs 0.950)
+```
+
+The framework is programmatic as well — import `runComparison(config, epochSize)` to integrate comparison into the evolution loop or custom research scripts.
 
 ---
 
@@ -243,12 +279,15 @@ The reputation system is a standalone module (`src/protocols/reputation.ts`) tha
 
 ## Current Status
 
-Agora is functional. The evolution loop runs. 119 tests pass across 5 test files. CI runs on every push via GitHub Actions.
+Agora is functional. The evolution loop runs. 211 tests pass across 7 test files. CI runs on every push via GitHub Actions.
 
 ```bash
-npm test                              # 119 tests pass
+npm test                              # 211 tests pass
 npm start                             # mock agents complete a trade
 npm start -- --llm                    # LLM agents negotiate (needs API key)
+npm run compare                       # compare bilateral vs auction protocols
+npm run llm-auction                   # LLM-driven auction (first-price)
+npm run llm-auction -- --type vickrey # LLM-driven Vickrey auction
 npx tsx src/evolution/run.ts          # self-evolution loop (runs indefinitely)
 npx tsx src/evolution/run.ts --iters 5  # 5 evolution iterations
 ```
@@ -257,19 +296,22 @@ npx tsx src/evolution/run.ts --iters 5  # 5 evolution iterations
 
 - Full transaction lifecycle: discovery → negotiation → commitment → delivery → verification → settlement
 - Escrow protocol with hash-based delivery proof and timeout revert
-- Sealed-bid first-price auction with 1 auctioneer + N bidders
+- Sealed-bid first-price **and Vickrey (second-price)** auctions with 1 auctioneer + N bidders
+- LLM-driven auction bidders (Claude Haiku) with game-theoretically correct system prompts — bid-shading for first-price, truthful bidding for Vickrey
+- Protocol comparison framework — run bilateral and auction protocols side-by-side under an identical `ProtocolConfig`, get a metrics table and a plain-text recommendation (`npm run compare`)
 - Bayesian reputation system with time decay and escrow integration
 - LLM-driven agents (Claude) with Zod-validated structured outputs
 - Self-evolution loop: propose → test → keep/discard → git commit
+- 27 property-based invariant tests verifying ledger conservation, escrow round-trips, reputation monotonicity, and auction settlement correctness
 - CI via GitHub Actions (tests run on push)
 - Mock fallback for everything (no API key required to run)
 
 ### What's next
 
-- Protocol comparison framework — run the same scenario under different coordination mechanisms and compare outcomes
-- More auction types (Dutch, Vickrey)
-- Protocol diversity — alternative coordination mechanisms beyond escrow
-- Formal verification of protocol invariants
+- Protocol diversity — alternative coordination mechanisms beyond escrow (ZK commitment, committee arbitration)
+- Dutch auction support
+- Multi-round reputation-gated participation
+- On-chain settlement interface (x402 / Base L2)
 
 ---
 
@@ -292,10 +334,24 @@ export ANTHROPIC_API_KEY=your_key    # Windows: set ANTHROPIC_API_KEY=your_key
 npm start -- --llm
 ```
 
-To run an auction:
+To run an auction (mock agents):
 
 ```bash
-npx tsx src/scenarios/auction.ts
+npx tsx src/scenarios/auction.ts                  # first-price
+npx tsx src/scenarios/auction.ts --type vickrey   # Vickrey
+```
+
+To run an LLM-driven auction (Claude Haiku bidders):
+
+```bash
+npm run llm-auction                    # first-price
+npm run llm-auction -- --type vickrey  # Vickrey
+```
+
+To compare bilateral vs auction protocols:
+
+```bash
+npm run compare
 ```
 
 To run the self-evolution loop:
