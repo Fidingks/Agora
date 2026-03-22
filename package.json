@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "compare": "tsx src/evolution/compare.ts",
     "dev": "tsx watch src/cli.ts",
     "start": "tsx src/cli.ts",
     "test": "vitest run",
