@@ -196,7 +196,8 @@ src/
 │   └── agent.ts                   # abstract Agent base class
 ├── protocols/                     # MUTABLE — agents can propose changes here
 │   ├── types.ts                   # ProtocolConfig, metrics, interfaces
-│   └── escrow.ts                  # escrow state machine (negotiate → settle)
+│   ├── escrow.ts                  # escrow state machine (negotiate → settle)
+│   └── reputation.ts             # Bayesian reputation with time decay
 ├── agents/                        # LLM-powered agent implementations
 │   ├── llm-agent.ts              # abstract LLMAgent with Claude SDK
 │   └── llm-data-market.ts        # LLM buyer/seller agents
@@ -208,18 +209,44 @@ src/
 │   └── config-store.ts          # persist protocol state to disk
 ├── scenarios/                     # runnable experiments
 │   ├── data-market.ts            # mock agents: bilateral data trade
-│   └── llm-data-market.ts       # LLM agents: real negotiation
+│   ├── llm-data-market.ts       # LLM agents: real negotiation
+│   └── auction.ts               # sealed-bid first-price auction
 └── cli.ts                        # entry point
 ```
 
 ---
 
+## The Auction Scenario
+
+The second scenario is a sealed-bid first-price auction — Agora's first multi-agent coordination problem.
+
+- **1 auctioneer + 2–5 bidders**, each with private valuations and configurable aggressiveness
+- **Sealed bids** — bidders submit a single bid without seeing others' bids; highest bid above the reserve price wins (first bidder wins ties)
+- **Settlement via escrow** — the winner enters the standard COMMIT → DELIVER → VERIFY → RELEASE flow with the auctioneer
+- **Reputation-integrated** — when a `ReputationStore` is provided, successful and failed auctions update both parties' scores
+
+This tests coordination under competition rather than bilateral negotiation. The auctioneer is a new agent role that broadcasts, collects, and adjudicates rather than negotiating.
+
+---
+
+## Reputation System
+
+Agora includes a pluggable reputation module that tracks per-agent trust:
+
+- **Bayesian scoring with Laplace smoothing:** `score = (successes + 1) / (successes + failures + 2)`. New agents start at 0.5 (neutral). The score converges toward 1.0 with consistent success and toward 0.0 with consistent failure.
+- **Time decay toward neutral:** an exponential decay function pulls scores back toward 0.5, so agents cannot ride on stale reputation indefinitely.
+- **Integrated into escrow:** the `shouldAllowTrade` hook lets protocols gate participation — agents below a minimum reputation threshold can be blocked before a transaction begins.
+
+The reputation system is a standalone module (`src/protocols/reputation.ts`) that any protocol or scenario can import.
+
+---
+
 ## Current Status
 
-Agora is functional. The evolution loop runs. 48 tests pass.
+Agora is functional. The evolution loop runs. 119 tests pass across 5 test files. CI runs on every push via GitHub Actions.
 
 ```bash
-npm test                              # 48 tests pass
+npm test                              # 119 tests pass
 npm start                             # mock agents complete a trade
 npm start -- --llm                    # LLM agents negotiate (needs API key)
 npx tsx src/evolution/run.ts          # self-evolution loop (runs indefinitely)
@@ -230,14 +257,17 @@ npx tsx src/evolution/run.ts --iters 5  # 5 evolution iterations
 
 - Full transaction lifecycle: discovery → negotiation → commitment → delivery → verification → settlement
 - Escrow protocol with hash-based delivery proof and timeout revert
+- Sealed-bid first-price auction with 1 auctioneer + N bidders
+- Bayesian reputation system with time decay and escrow integration
 - LLM-driven agents (Claude) with Zod-validated structured outputs
 - Self-evolution loop: propose → test → keep/discard → git commit
+- CI via GitHub Actions (tests run on push)
 - Mock fallback for everything (no API key required to run)
 
 ### What's next
 
-- Reputation system — per-agent trade history, configurable decay
-- Multi-agent scenarios — auctions, competing buyers, arbitrator roles
+- Protocol comparison framework — run the same scenario under different coordination mechanisms and compare outcomes
+- More auction types (Dutch, Vickrey)
 - Protocol diversity — alternative coordination mechanisms beyond escrow
 - Formal verification of protocol invariants
 
@@ -260,6 +290,12 @@ To run with LLM-driven agents:
 ```bash
 export ANTHROPIC_API_KEY=your_key    # Windows: set ANTHROPIC_API_KEY=your_key
 npm start -- --llm
+```
+
+To run an auction:
+
+```bash
+npx tsx src/scenarios/auction.ts
 ```
 
 To run the self-evolution loop:
