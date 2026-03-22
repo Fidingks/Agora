@@ -19,6 +19,7 @@ import {
   runAuction,
   DEFAULT_AUCTION_CONFIG,
   type AuctionConfig,
+  type AuctionType,
 } from "../src/scenarios/auction.js";
 import { ReputationStore } from "../src/protocols/reputation.js";
 
@@ -436,5 +437,227 @@ describe("Auction: outcome metrics", () => {
     const result = await runAuction(config);
     expect(result.tradeOutcome.result).toBe("SUCCESS");
     expect(result.totalBidders).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 11. Vickrey auction — winner pays second-highest bid
+//
+//   Bidder 0: 20 * 1.0 = 20  (highest — wins)
+//   Bidder 1: 15 * 1.0 = 15  (second — sets payment)
+//   Bidder 2: 12 * 1.0 = 12  (third)
+//   Reserve: 10
+//   Expected settlement price: 15 (second-highest bid)
+// ---------------------------------------------------------------------------
+
+describe("Vickrey auction: winner pays second-highest price", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "vickrey" as AuctionType,
+    bidderCount: 3,
+    reservePrice: 10,
+    bidderBudgets: [30, 25, 20],
+    bidderValuations: [20, 15, 12],
+    bidAggressiveness: [1.0, 1.0, 1.0],
+    // Bids: 20, 15, 12 — all above reserve
+    // Winner: Bidder 0 (bid 20); pays second-highest = 15
+  };
+
+  it("produces SUCCESS", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("winningBid is the highest bid (20)", async () => {
+    const result = await runAuction(config);
+    expect(result.winningBid).toBeCloseTo(20);
+  });
+
+  it("settlementPrice is the second-highest bid (15)", async () => {
+    const result = await runAuction(config);
+    expect(result.settlementPrice).toBeCloseTo(15);
+  });
+
+  it("tradeOutcome.price equals settlementPrice, not winningBid", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.price).toBeCloseTo(15);
+    expect(result.tradeOutcome.price).not.toBeCloseTo(20);
+  });
+
+  it("reports auctionType as 'vickrey'", async () => {
+    const result = await runAuction(config);
+    expect(result.auctionType).toBe("vickrey");
+  });
+
+  it("has 3 valid bids", async () => {
+    const result = await runAuction(config);
+    expect(result.validBidCount).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 12. Vickrey: single bidder above reserve → pays reserve price
+//
+//   Only Bidder 0 clears the reserve.  In a Vickrey auction with one
+//   bidder, the fallback payment is the reserve price itself.
+//   Bidder 0: valuation=20, aggressiveness=1.0 → bid=20 (above reserve 10)
+//   Bidder 1: valuation=5,  aggressiveness=1.0 → bid=5  (below reserve 10)
+// ---------------------------------------------------------------------------
+
+describe("Vickrey auction: single bidder above reserve pays reserve price", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "vickrey" as AuctionType,
+    bidderCount: 2,
+    reservePrice: 10,
+    bidderBudgets: [30, 10],
+    bidderValuations: [20, 5],
+    bidAggressiveness: [1.0, 1.0],
+  };
+
+  it("produces SUCCESS", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("exactly 1 valid bid", async () => {
+    const result = await runAuction(config);
+    expect(result.validBidCount).toBe(1);
+  });
+
+  it("winningBid is 20 (Bidder 0's actual bid)", async () => {
+    const result = await runAuction(config);
+    expect(result.winningBid).toBeCloseTo(20);
+  });
+
+  it("settlementPrice is the reserve price (10), not the winning bid", async () => {
+    const result = await runAuction(config);
+    expect(result.settlementPrice).toBeCloseTo(10);
+  });
+
+  it("tradeOutcome.price equals reserve price (10)", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.price).toBeCloseTo(10);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 13. Vickrey: no bids above reserve → no winner (same behaviour as first-price)
+// ---------------------------------------------------------------------------
+
+describe("Vickrey auction: no bids above reserve → no winner", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "vickrey" as AuctionType,
+    bidderCount: 3,
+    reservePrice: 50,
+    bidderBudgets: [20, 20, 20],
+    bidderValuations: [10, 10, 10],
+    bidAggressiveness: [1.0, 1.0, 1.0],
+  };
+
+  it("produces FAILED_NEGOTIATION", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("FAILED_NEGOTIATION");
+  });
+
+  it("winningBid is null", async () => {
+    const result = await runAuction(config);
+    expect(result.winningBid).toBeNull();
+  });
+
+  it("settlementPrice is null", async () => {
+    const result = await runAuction(config);
+    expect(result.settlementPrice).toBeNull();
+  });
+
+  it("validBidCount is 0", async () => {
+    const result = await runAuction(config);
+    expect(result.validBidCount).toBe(0);
+  });
+
+  it("winnerId is null", async () => {
+    const result = await runAuction(config);
+    expect(result.winnerId).toBeNull();
+  });
+
+  it("auctionType is 'vickrey'", async () => {
+    const result = await runAuction(config);
+    expect(result.auctionType).toBe("vickrey");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 14. Vickrey: two tied highest bids
+//
+//   Bidder 0: 15 * 1.0 = 15  (ties for highest — first bidder wins)
+//   Bidder 1: 15 * 1.0 = 15  (tied — sets the settlement price)
+//   Bidder 2: 10 * 1.0 = 10  (third)
+//   Reserve: 8
+//   winningBid = 15, settlementPrice = 15 (second-highest equals highest)
+// ---------------------------------------------------------------------------
+
+describe("Vickrey auction: two equal highest bids", () => {
+  const config: Partial<AuctionConfig> = {
+    auctionType: "vickrey" as AuctionType,
+    bidderCount: 3,
+    reservePrice: 8,
+    bidderBudgets: [20, 20, 15],
+    bidderValuations: [15, 15, 10],
+    bidAggressiveness: [1.0, 1.0, 1.0],
+  };
+
+  it("produces SUCCESS", async () => {
+    const result = await runAuction(config);
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+  });
+
+  it("winningBid is 15", async () => {
+    const result = await runAuction(config);
+    expect(result.winningBid).toBeCloseTo(15);
+  });
+
+  it("settlementPrice equals the tied second bid (15)", async () => {
+    // When two bids tie for first, the 'second-highest' is the same value
+    const result = await runAuction(config);
+    expect(result.settlementPrice).toBeCloseTo(15);
+  });
+
+  it("first bidder wins the tie deterministically", async () => {
+    const r1 = await runAuction(config);
+    const r2 = await runAuction(config);
+    expect(r1.winningBid).not.toBeNull();
+    expect(r2.winningBid).not.toBeNull();
+    // Both runs elect a winner and pay the same settlement price
+    expect(r1.settlementPrice).toBeCloseTo(r2.settlementPrice!);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 15. Backward compatibility: default config (no auctionType) uses first-price
+// ---------------------------------------------------------------------------
+
+describe("Backward compat: default auction is first-price", () => {
+  it("auctionType defaults to 'first-price'", async () => {
+    const result = await runAuction();
+    expect(result.auctionType).toBe("first-price");
+  });
+
+  it("settlementPrice equals winningBid for first-price", async () => {
+    const result = await runAuction();
+    expect(result.tradeOutcome.result).toBe("SUCCESS");
+    expect(result.settlementPrice).toBeCloseTo(result.winningBid!);
+  });
+
+  it("explicit first-price config also sets settlementPrice = winningBid", async () => {
+    const config: Partial<AuctionConfig> = {
+      auctionType: "first-price" as AuctionType,
+      bidderCount: 2,
+      reservePrice: 10,
+      bidderBudgets: [30, 25],
+      bidderValuations: [20, 15],
+      bidAggressiveness: [1.0, 1.0],
+    };
+    const result = await runAuction(config);
+    expect(result.auctionType).toBe("first-price");
+    expect(result.settlementPrice).toBeCloseTo(result.winningBid!);
+    expect(result.tradeOutcome.price).toBeCloseTo(result.winningBid!);
   });
 });

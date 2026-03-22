@@ -278,6 +278,20 @@ export class BidderAgent extends Agent {
 }
 
 // ---------------------------------------------------------------------------
+// Auction type
+// ---------------------------------------------------------------------------
+
+/**
+ * Supported auction mechanisms:
+ *   "first-price" — winner pays their own (highest) bid.
+ *   "vickrey"     — winner pays the second-highest bid (or reserve price
+ *                   when only one bid clears the reserve).  This is the
+ *                   classic second-price sealed-bid mechanism that makes
+ *                   truthful bidding a dominant strategy.
+ */
+export type AuctionType = "first-price" | "vickrey";
+
+// ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
@@ -296,6 +310,11 @@ export interface AuctionConfig {
   protocol?: Partial<ProtocolConfig>;
   /** Optional reputation store */
   reputationStore?: ReputationStore;
+  /**
+   * Auction mechanism.  Defaults to "first-price" so all existing callers
+   * are unaffected.
+   */
+  auctionType?: AuctionType;
 }
 
 export const DEFAULT_AUCTION_CONFIG: AuctionConfig = {
@@ -317,14 +336,28 @@ export const DEFAULT_AUCTION_CONFIG: AuctionConfig = {
 export interface AuctionOutcome {
   /** The trade outcome (reuses TradeOutcome from types.ts) */
   tradeOutcome: TradeOutcome;
-  /** Winning bid price, or null if no winner */
+  /**
+   * The highest bid submitted, or null if no winner.
+   * In a Vickrey auction this is NOT what the winner pays — see
+   * `settlementPrice` for the actual payment.
+   */
   winningBid: number | null;
+  /**
+   * The price actually paid by the winner (and recorded in the ledger).
+   *   first-price: equals winningBid
+   *   vickrey    : equals the second-highest bid, or the reserve price when
+   *                only one bidder cleared the reserve
+   * Null when there is no winner.
+   */
+  settlementPrice: number | null;
   /** Number of valid bids received */
   validBidCount: number;
   /** Total bidders */
   totalBidders: number;
   /** Winner agent ID, or null */
   winnerId: AgentId | null;
+  /** Auction mechanism that was used */
+  auctionType: AuctionType;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +434,7 @@ export async function runAuction(
   config?: Partial<AuctionConfig>,
 ): Promise<AuctionOutcome> {
   const cfg: AuctionConfig = { ...DEFAULT_AUCTION_CONFIG, ...config };
+  const auctionType: AuctionType = cfg.auctionType ?? "first-price";
   const startedAt = Date.now();
   const ledger = new Ledger();
 
@@ -495,15 +529,40 @@ export async function runAuction(
         negotiationRounds: 1,
       },
       winningBid: null,
+      settlementPrice: null,
       validBidCount: 0,
       totalBidders: cfg.bidderCount,
       winnerId: null,
+      auctionType,
     };
   }
 
   // Sort descending by price; stable sort preserves insertion order for ties
   validBids.sort((a, b) => b.price - a.price);
   const winner = validBids[0]!;
+
+  // ------------------------------------------------------------------
+  // Determine settlement price based on auction type.
+  //
+  // first-price: winner pays their own bid (winner.price)
+  // vickrey:     winner pays the second-highest bid, or the reserve
+  //              price when they are the only valid bidder.
+  // ------------------------------------------------------------------
+
+  let settlementPrice: number;
+  if (auctionType === "vickrey") {
+    if (validBids.length >= 2) {
+      // Second-highest bid is the first element after the winner in the
+      // sorted (descending) array.
+      settlementPrice = validBids[1]!.price;
+    } else {
+      // Only one bidder cleared the reserve — they pay the reserve price.
+      settlementPrice = cfg.reservePrice;
+    }
+  } else {
+    // first-price: pay your own bid
+    settlementPrice = winner.price;
+  }
 
   // ------------------------------------------------------------------
   // Phase 3: Notify winner (ACCEPT) and losers (REJECT)
@@ -513,7 +572,7 @@ export async function runAuction(
     from: auctioneer.id,
     to: winner.bidder.id,
     type: MessageType.ACCEPT,
-    payload: { acceptedOfferId: "" as MessageId, agreedPrice: winner.price },
+    payload: { acceptedOfferId: "" as MessageId, agreedPrice: settlementPrice },
   });
   await winner.bidder.receive(acceptMsg);
 
@@ -537,7 +596,7 @@ export async function runAuction(
   const settled = await settleEscrow(
     auctioneer,
     winner.bidder,
-    winner.price,
+    settlementPrice,
     ledger,
     acceptMsg.id,
   );
@@ -559,14 +618,16 @@ export async function runAuction(
   return {
     tradeOutcome: {
       result: tradeResult,
-      price: settled ? winner.price : undefined,
+      price: settled ? settlementPrice : undefined,
       durationMs,
       agentIds: allAgentIds,
       negotiationRounds: 1,
     },
     winningBid: winner.price,
+    settlementPrice: settled ? settlementPrice : null,
     validBidCount: validBids.length,
     totalBidders: cfg.bidderCount,
     winnerId: winner.bidder.id,
+    auctionType,
   };
 }
