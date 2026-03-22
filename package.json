@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
+    "commitment-demo": "tsx src/scenarios/commitment-demo.ts",
     "compare": "tsx src/evolution/compare.ts",
     "dev": "tsx watch src/cli.ts",
     "events-demo": "tsx src/scenarios/events-demo.ts",
