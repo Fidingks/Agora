@@ -43,6 +43,7 @@ import {
   type TradeOutcome,
 } from "./types.js";
 import { shouldAllowTrade, type ReputationStore } from "./reputation.js";
+import type { EventLog } from "../core/event-log.js";
 
 // ---------------------------------------------------------------------------
 // Escrow protocol stages (internal)
@@ -88,17 +89,24 @@ export class EscrowProtocol implements CoordinationProtocol {
   readonly name = "escrow-v1";
   readonly config: ProtocolConfig;
   readonly reputationStore?: ReputationStore;
+  readonly eventLog?: EventLog;
 
   constructor(
     config: ProtocolConfig = DEFAULT_PROTOCOL_CONFIG,
     reputationStore?: ReputationStore,
+    eventLog?: EventLog,
   ) {
     this.config = config;
     this.reputationStore = reputationStore;
+    this.eventLog = eventLog;
   }
 
   withConfig(overrides: Partial<ProtocolConfig>): EscrowProtocol {
-    return new EscrowProtocol({ ...this.config, ...overrides }, this.reputationStore);
+    return new EscrowProtocol(
+      { ...this.config, ...overrides },
+      this.reputationStore,
+      this.eventLog,
+    );
   }
 
   // ------------------------------------------------------------------
@@ -119,11 +127,18 @@ export class EscrowProtocol implements CoordinationProtocol {
       startedAt: Date.now(),
     };
 
+    this.eventLog?.emit("escrow", "escrow.negotiate", [seller.id, buyer.id], {
+      stage: "NEGOTIATE",
+    });
+
     // Reputation gate: if a ReputationStore is present, check both agents
     if (this.reputationStore) {
       const minScore = this.config.minReputationScore;
       if (!shouldAllowTrade(this.reputationStore, seller.id, minScore)) {
         state.stage = "FAILED";
+        this.eventLog?.emit("escrow", "escrow.failed", [seller.id, buyer.id], {
+          reason: "seller insufficient reputation",
+        });
         const rejectMsg = createMessage<RejectPayload>({
           from: buyer.id,
           to: seller.id,
@@ -142,6 +157,9 @@ export class EscrowProtocol implements CoordinationProtocol {
       }
       if (!shouldAllowTrade(this.reputationStore, buyer.id, minScore)) {
         state.stage = "FAILED";
+        this.eventLog?.emit("escrow", "escrow.failed", [seller.id, buyer.id], {
+          reason: "buyer insufficient reputation",
+        });
         const rejectMsg = createMessage<RejectPayload>({
           from: seller.id,
           to: buyer.id,
@@ -219,6 +237,23 @@ export class EscrowProtocol implements CoordinationProtocol {
       }
     }
 
+    // Emit final outcome event
+    this.eventLog?.emit(
+      "escrow",
+      state.stage === "SETTLED"
+        ? "escrow.settled"
+        : state.stage === "DISPUTED"
+        ? "escrow.disputed"
+        : "escrow.failed",
+      [seller.id, buyer.id],
+      {
+        stage: state.stage,
+        price: state.currentPrice,
+        rounds: state.rounds,
+        durationMs: Date.now() - state.startedAt,
+      }
+    );
+
     return {
       result:
         state.stage === "SETTLED"
@@ -249,6 +284,10 @@ export class EscrowProtocol implements CoordinationProtocol {
         const acceptPayload = reply.payload as AcceptPayload;
         state.currentPrice = acceptPayload.agreedPrice;
         state.stage = "COMMIT";
+        this.eventLog?.emit("negotiation", "negotiation.accepted", [seller.id, buyer.id], {
+          agreedPrice: state.currentPrice,
+          rounds: state.rounds,
+        });
         await this._runCommitPhase(reply, seller, buyer, state, ledger);
         return null;
       }
@@ -257,6 +296,13 @@ export class EscrowProtocol implements CoordinationProtocol {
         const counterPayload = reply.payload as CounterPayload;
         const deviation =
           Math.abs(counterPayload.proposedPrice - state.currentPrice) / state.currentPrice;
+
+        this.eventLog?.emit("negotiation", "negotiation.counter", [seller.id, buyer.id], {
+          proposedPrice: counterPayload.proposedPrice,
+          currentPrice: state.currentPrice,
+          deviation,
+          round: state.rounds,
+        });
 
         if (deviation > this.config.maxPriceDeviation) {
           // Price gap is too large — seller rejects
@@ -268,6 +314,10 @@ export class EscrowProtocol implements CoordinationProtocol {
             replyTo: reply.id,
           });
           state.stage = "FAILED";
+          this.eventLog?.emit("negotiation", "negotiation.rejected", [seller.id, buyer.id], {
+            reason: "price deviation exceeds tolerance",
+            deviation,
+          });
           await buyer.send(rejectMsg);
           return null;
         }
@@ -291,6 +341,9 @@ export class EscrowProtocol implements CoordinationProtocol {
 
       case MessageType.REJECT: {
         state.stage = "FAILED";
+        this.eventLog?.emit("negotiation", "negotiation.rejected", [seller.id, buyer.id], {
+          reason: "buyer rejected offer",
+        });
         return null;
       }
 
@@ -315,9 +368,17 @@ export class EscrowProtocol implements CoordinationProtocol {
     const escrowResult = ledger.escrow(buyer.id, state.currentPrice);
     if (!escrowResult.ok) {
       state.stage = "FAILED";
+      this.eventLog?.emit("escrow", "escrow.failed", [seller.id, buyer.id], {
+        reason: "ledger escrow failed",
+        error: escrowResult.error.message,
+      });
       return;
     }
     state.escrowId = escrowResult.value;
+    this.eventLog?.emit("escrow", "escrow.locked", [seller.id, buyer.id], {
+      escrowId: state.escrowId,
+      amount: state.currentPrice,
+    });
 
     const commitMsg = createMessage<CommitPayload>({
       from: buyer.id,
@@ -333,17 +394,29 @@ export class EscrowProtocol implements CoordinationProtocol {
       // Seller didn't deliver — refund buyer
       assertOk(ledger.refundEscrow(state.escrowId), "refund on missing delivery");
       state.stage = "REFUNDED";
+      this.eventLog?.emit("escrow", "escrow.refunded", [seller.id, buyer.id], {
+        escrowId: state.escrowId,
+        reason: "seller did not deliver",
+      });
       return;
     }
 
     const deliverPayload = deliverResponse.payload as DeliverPayload;
     state.deliveryHash = deliverPayload.contentHash;
+    this.eventLog?.emit("escrow", "escrow.delivered", [seller.id, buyer.id], {
+      itemId: deliverPayload.itemId,
+      contentHash: deliverPayload.contentHash,
+    });
 
     // Buyer verifies delivery
     const verifyResponse = await buyer.send(deliverResponse);
     if (!verifyResponse || verifyResponse.type !== MessageType.VERIFY) {
       assertOk(ledger.refundEscrow(state.escrowId), "refund on missing verify");
       state.stage = "REFUNDED";
+      this.eventLog?.emit("escrow", "escrow.refunded", [seller.id, buyer.id], {
+        escrowId: state.escrowId,
+        reason: "buyer did not verify",
+      });
       return;
     }
 
@@ -353,9 +426,17 @@ export class EscrowProtocol implements CoordinationProtocol {
       // Verification failed — could open dispute; for now refund
       if (verifyPayload.reason === "DISPUTE") {
         state.stage = "DISPUTED";
+        this.eventLog?.emit("escrow", "escrow.disputed", [seller.id, buyer.id], {
+          escrowId: state.escrowId,
+          reason: verifyPayload.reason,
+        });
       } else {
         assertOk(ledger.refundEscrow(state.escrowId), "refund on verify=false");
         state.stage = "REFUNDED";
+        this.eventLog?.emit("escrow", "escrow.refunded", [seller.id, buyer.id], {
+          escrowId: state.escrowId,
+          reason: "verification failed",
+        });
       }
       return;
     }
@@ -373,5 +454,9 @@ export class EscrowProtocol implements CoordinationProtocol {
     await seller.send(releaseMsg);
 
     state.stage = "SETTLED";
+    this.eventLog?.emit("escrow", "escrow.released", [seller.id, buyer.id], {
+      escrowId: state.escrowId,
+      amount: state.currentPrice,
+    });
   }
 }

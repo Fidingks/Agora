@@ -14,6 +14,7 @@
  */
 
 import type { AgentId } from "../core/identity.js";
+import type { EventLog } from "../core/event-log.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,6 +49,11 @@ function computeScore(successes: number, failures: number): number {
 
 export class ReputationStore {
   private readonly _records = new Map<AgentId, MutableRecord>();
+  readonly eventLog?: EventLog;
+
+  constructor(eventLog?: EventLog) {
+    this.eventLog = eventLog;
+  }
 
   // ------------------------------------------------------------------
   // Read
@@ -97,6 +103,11 @@ export class ReputationStore {
     const rec = this._getOrCreate(agentId);
     rec.successCount++;
     rec.lastUpdated = Date.now();
+    this.eventLog?.emit("reputation", "reputation.success", [agentId], {
+      successCount: rec.successCount,
+      failureCount: rec.failureCount,
+      score: computeScore(rec.successCount, rec.failureCount),
+    });
   }
 
   /** Record a failed / disputed trade for an agent. */
@@ -104,6 +115,11 @@ export class ReputationStore {
     const rec = this._getOrCreate(agentId);
     rec.failureCount++;
     rec.lastUpdated = Date.now();
+    this.eventLog?.emit("reputation", "reputation.failure", [agentId], {
+      successCount: rec.successCount,
+      failureCount: rec.failureCount,
+      score: computeScore(rec.successCount, rec.failureCount),
+    });
   }
 
   // ------------------------------------------------------------------

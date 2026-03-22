@@ -7,6 +7,7 @@
     "build": "tsc",
     "compare": "tsx src/evolution/compare.ts",
     "dev": "tsx watch src/cli.ts",
+    "events-demo": "tsx src/scenarios/events-demo.ts",
     "llm-auction": "tsx src/scenarios/llm-auction.ts",
     "start": "tsx src/cli.ts",
     "test": "vitest run",

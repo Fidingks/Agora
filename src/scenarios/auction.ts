@@ -37,6 +37,7 @@ import {
 } from "../core/message.js";
 import type { ProtocolConfig, TradeOutcome } from "../protocols/types.js";
 import type { ReputationStore } from "../protocols/reputation.js";
+import type { EventLog } from "../core/event-log.js";
 import { createHash } from "node:crypto";
 
 // ---------------------------------------------------------------------------
@@ -329,6 +330,8 @@ export interface AuctionConfig {
   protocol?: Partial<ProtocolConfig>;
   /** Optional reputation store */
   reputationStore?: ReputationStore;
+  /** Optional event log — all meaningful auction actions will be emitted. */
+  eventLog?: EventLog;
   /**
    * Auction mechanism.  Defaults to "first-price" so all existing callers
    * are unaffected.
@@ -484,6 +487,7 @@ async function runDutchAuction(
   allAgentIds: AgentId[],
   ledger: Ledger,
   startedAt: number,
+  eventLog?: EventLog,
 ): Promise<AuctionOutcome> {
   const startingPrice = cfg.startingPrice ?? cfg.reservePrice * 2;
   const priceDecrement = cfg.priceDecrement ?? cfg.reservePrice * 0.1;
@@ -533,6 +537,13 @@ async function runDutchAuction(
       const winner = acceptors[0]!;
       const settlementPrice = currentPrice;
 
+      eventLog?.emit("auction", "auction.bid", [winner.id, auctioneer.id], {
+        auctionType: "dutch",
+        bid: settlementPrice,
+        round,
+        acceptorCount: acceptors.length,
+      });
+
       // Notify the winner
       const acceptMsg = createMessage<AcceptPayload>({
         from: auctioneer.id,
@@ -541,6 +552,12 @@ async function runDutchAuction(
         payload: { acceptedOfferId: "" as MessageId, agreedPrice: settlementPrice },
       });
       await winner.receive(acceptMsg);
+
+      eventLog?.emit("auction", "auction.winner", [winner.id, auctioneer.id], {
+        auctionType: "dutch",
+        settlementPrice,
+        round,
+      });
 
       // Notify all non-winners (other acceptors and still-active bidders)
       for (const bidder of activeBidders) {
@@ -578,6 +595,13 @@ async function runDutchAuction(
 
       const tradeResult = settled ? "SUCCESS" as const : "FAILED_DELIVERY" as const;
 
+      eventLog?.emit("auction", settled ? "auction.settled" : "auction.failed", allAgentIds, {
+        auctionType: "dutch",
+        settlementPrice: settled ? settlementPrice : null,
+        durationMs,
+        rounds: roundsRun,
+      });
+
       return {
         tradeOutcome: {
           result: tradeResult,
@@ -607,6 +631,12 @@ async function runDutchAuction(
 
   // No winner after all rounds
   const durationMs = Date.now() - startedAt;
+
+  eventLog?.emit("auction", "auction.no_winner", allAgentIds, {
+    auctionType: "dutch",
+    durationMs,
+    rounds: roundsRun,
+  });
 
   // Notify all bidders that the auction failed
   for (const bidder of bidders) {
@@ -689,8 +719,16 @@ export async function runAuction(
   // Dutch auction has a completely different flow — delegate immediately.
   // ------------------------------------------------------------------
 
+  const eventLog = cfg.eventLog;
+
+  eventLog?.emit("auction", "auction.started", allAgentIds, {
+    auctionType,
+    reservePrice: cfg.reservePrice,
+    bidderCount: cfg.bidderCount,
+  });
+
   if (auctionType === "dutch") {
-    return runDutchAuction(cfg, auctioneer, bidders, allAgentIds, ledger, startedAt);
+    return runDutchAuction(cfg, auctioneer, bidders, allAgentIds, ledger, startedAt, eventLog);
   }
 
   // ------------------------------------------------------------------
@@ -714,6 +752,11 @@ export async function runAuction(
       const counterPayload = response.payload as CounterPayload;
       if (counterPayload.proposedPrice >= cfg.reservePrice) {
         validBids.push({ bidder, price: counterPayload.proposedPrice });
+        eventLog?.emit("auction", "auction.bid", [bidder.id, auctioneer.id], {
+          auctionType,
+          bid: counterPayload.proposedPrice,
+          reservePrice: cfg.reservePrice,
+        });
       }
     }
     // REJECT or anything else → bidder passed
@@ -726,6 +769,12 @@ export async function runAuction(
   if (validBids.length === 0) {
     // No valid bids — auction fails
     const durationMs = Date.now() - startedAt;
+
+    eventLog?.emit("auction", "auction.no_winner", allAgentIds, {
+      auctionType,
+      reason: "no valid bids",
+      durationMs,
+    });
 
     // Notify all bidders that auction failed
     for (const bidder of bidders) {
@@ -782,6 +831,13 @@ export async function runAuction(
     settlementPrice = winner.price;
   }
 
+  eventLog?.emit("auction", "auction.winner", [winner.bidder.id, auctioneer.id], {
+    auctionType,
+    winningBid: winner.price,
+    settlementPrice,
+    validBidCount: validBids.length,
+  });
+
   // ------------------------------------------------------------------
   // Phase 3: Notify winner (ACCEPT) and losers (REJECT)
   // ------------------------------------------------------------------
@@ -832,6 +888,12 @@ export async function runAuction(
   }
 
   const tradeResult = settled ? "SUCCESS" as const : "FAILED_DELIVERY" as const;
+
+  eventLog?.emit("auction", settled ? "auction.settled" : "auction.failed", allAgentIds, {
+    auctionType,
+    settlementPrice: settled ? settlementPrice : null,
+    durationMs,
+  });
 
   return {
     tradeOutcome: {
