@@ -10,6 +10,7 @@
     "dev": "tsx watch src/cli.ts",
     "events-demo": "tsx src/scenarios/events-demo.ts",
     "llm-auction": "tsx src/scenarios/llm-auction.ts",
+    "arbitration-demo": "tsx src/scenarios/arbitration-demo.ts",
     "multi-party": "tsx src/scenarios/multi-party.ts",
     "start": "tsx src/cli.ts",
     "test": "vitest run",
