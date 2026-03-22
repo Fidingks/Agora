@@ -11,10 +11,12 @@
  * The loop runs indefinitely until interrupted (CTRL+C).
  *
  * Usage:
- *   npx tsx src/evolution/run.ts                # run forever, 20 trades/epoch
- *   npx tsx src/evolution/run.ts --iters 5      # stop after 5 iterations
- *   npx tsx src/evolution/run.ts --runs 30      # 30 trades per epoch
- *   npx tsx src/evolution/run.ts --dry-run      # show proposal but don't commit
+ *   npx tsx src/evolution/run.ts                          # run forever, 20 trades/epoch (bilateral)
+ *   npx tsx src/evolution/run.ts --scenario bilateral      # same as above
+ *   npx tsx src/evolution/run.ts --scenario auction         # optimize auction parameters
+ *   npx tsx src/evolution/run.ts --iters 5                 # stop after 5 iterations
+ *   npx tsx src/evolution/run.ts --runs 30                 # 30 trades per epoch
+ *   npx tsx src/evolution/run.ts --dry-run                 # show proposal but don't commit
  */
 
 import { execSync } from "node:child_process";
@@ -40,6 +42,7 @@ import {
   saveCurrentConfig,
   CURRENT_PROTOCOL_PATH,
 } from "./config-store.js";
+import { runAuctionEpoch } from "./auction-loop.js";
 
 // ---------------------------------------------------------------------------
 // Project root (needed for results.tsv path)
@@ -108,12 +111,15 @@ interface RunArgs {
   runs: number;
   /** If true, print the proposal but do not write files or commit. */
   dryRun: boolean;
+  /** Which scenario to optimize: bilateral (data-market) or auction. */
+  scenario: "bilateral" | "auction";
 }
 
 function parseArgs(argv: string[]): RunArgs {
   let iters = 0;
   let runs = DEFAULT_EPOCH_RUNS;
   let dryRun = false;
+  let scenario: "bilateral" | "auction" = "bilateral";
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i] ?? "";
@@ -125,12 +131,16 @@ function parseArgs(argv: string[]): RunArgs {
       const v = parseInt(argv[i + 1] ?? "", 10);
       if (!isNaN(v) && v > 0) runs = v;
       i++;
+    } else if (arg === "--scenario" && i + 1 < argv.length) {
+      const v = (argv[i + 1] ?? "").toLowerCase();
+      if (v === "auction" || v === "bilateral") scenario = v;
+      i++;
     } else if (arg === "--dry-run") {
       dryRun = true;
     }
   }
 
-  return { iters, runs, dryRun };
+  return { iters, runs, dryRun, scenario };
 }
 
 // ---------------------------------------------------------------------------
@@ -282,9 +292,10 @@ function printIterationSummary(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
-  const { iters, runs, dryRun } = parseArgs(process.argv.slice(2));
+  const { iters, runs, dryRun, scenario } = parseArgs(process.argv.slice(2));
 
   console.log("\nAgora Protocol Evolution Loop");
+  console.log(`Scenario: ${scenario}`);
   console.log("CTRL+C to stop\n");
   if (dryRun) console.log("[dry-run mode — no files will be written or committed]\n");
 
@@ -295,8 +306,10 @@ async function main(): Promise<void> {
 
   // ── Iteration 0: baseline epoch with the current config ──────────────────
 
-  console.log(`Running baseline epoch (${runs} trades)…`);
-  const { outcomes: baseOutcomes } = await runEpoch(runs, currentConfig);
+  const epochRunner = scenario === "auction" ? runAuctionEpoch : runEpoch;
+
+  console.log(`Running baseline epoch (${runs} ${scenario === "auction" ? "auctions" : "trades"})…`);
+  const { outcomes: baseOutcomes } = await epochRunner(runs, currentConfig);
   let currentMetrics = computeMetrics(baseOutcomes);
 
   console.log(
@@ -337,7 +350,7 @@ async function main(): Promise<void> {
     const proposedConfig = applyProposal(currentConfig, proposal);
 
     // 3. Run an epoch with the proposed config.
-    const { outcomes: trialOutcomes } = await runEpoch(runs, proposedConfig);
+    const { outcomes: trialOutcomes } = await epochRunner(runs, proposedConfig);
     const trialMetrics = computeMetrics(trialOutcomes);
 
     // 4. Decide keep / discard.

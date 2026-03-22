@@ -17,6 +17,8 @@ export const SAFE_BOUNDS: Record<keyof ProtocolConfig, { min: number; max: numbe
   escrowTimeoutMs: { min: 1_000, max: 120_000 },
   minReputationScore: { min: 0, max: 1 },
   maxPriceDeviation: { min: 0.05, max: 0.95 },
+  reservePriceMultiplier: { min: 0.5, max: 2.0 },
+  minBidders: { min: 1, max: 5 },
 };
 
 /**

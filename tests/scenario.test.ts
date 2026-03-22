@@ -172,6 +172,8 @@ describe("reputation-gated trades", () => {
       escrowTimeoutMs: 30_000,
       minReputationScore: 0.4,
       maxPriceDeviation: 0.3,
+      reservePriceMultiplier: 1.0,
+      minBidders: 2,
     }, store);
 
     const outcome = await protocol.run(
@@ -204,6 +206,8 @@ describe("reputation-gated trades", () => {
       escrowTimeoutMs: 30_000,
       minReputationScore: 0.4,
       maxPriceDeviation: 0.3,
+      reservePriceMultiplier: 1.0,
+      minBidders: 2,
     }, store);
 
     const outcome = await protocol.run(
@@ -275,6 +279,8 @@ describe("reputation-gated trades", () => {
       escrowTimeoutMs: 30_000,
       minReputationScore: 0,
       maxPriceDeviation: 0.3,
+      reservePriceMultiplier: 1.0,
+      minBidders: 2,
     }, store);
 
     const outcome = await protocol.run(

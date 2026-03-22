@@ -144,12 +144,14 @@ describe("applyProposal", () => {
     expect(DEFAULT_PROTOCOL_CONFIG.maxPriceDeviation).toBe(original.maxPriceDeviation);
   });
 
-  it("applies changes to all four ProtocolConfig parameters correctly", () => {
+  it("applies changes to all six ProtocolConfig parameters correctly", () => {
     const params: Array<keyof typeof DEFAULT_PROTOCOL_CONFIG> = [
       "maxNegotiationRounds",
       "escrowTimeoutMs",
       "minReputationScore",
       "maxPriceDeviation",
+      "reservePriceMultiplier",
+      "minBidders",
     ];
 
     const newValues: Record<string, number> = {
@@ -157,6 +159,8 @@ describe("applyProposal", () => {
       escrowTimeoutMs: 60_000,
       minReputationScore: 0.5,
       maxPriceDeviation: 0.2,
+      reservePriceMultiplier: 1.5,
+      minBidders: 3,
     };
 
     for (const param of params) {
@@ -169,6 +173,30 @@ describe("applyProposal", () => {
       const result = applyProposal(DEFAULT_PROTOCOL_CONFIG, proposal);
       expect(result[param]).toBe(newValues[param]);
     }
+  });
+
+  it("applies auction-specific parameters (reservePriceMultiplier, minBidders)", () => {
+    const base = DEFAULT_PROTOCOL_CONFIG;
+
+    const rpProposal = {
+      parameterName: "reservePriceMultiplier" as const,
+      currentValue: base.reservePriceMultiplier,
+      proposedValue: 1.5,
+      rationale: "test auction param",
+    };
+    const rpResult = applyProposal(base, rpProposal);
+    expect(rpResult.reservePriceMultiplier).toBe(1.5);
+    expect(rpResult.minBidders).toBe(base.minBidders); // unchanged
+
+    const mbProposal = {
+      parameterName: "minBidders" as const,
+      currentValue: base.minBidders,
+      proposedValue: 4,
+      rationale: "test auction param",
+    };
+    const mbResult = applyProposal(base, mbProposal);
+    expect(mbResult.minBidders).toBe(4);
+    expect(mbResult.reservePriceMultiplier).toBe(base.reservePriceMultiplier); // unchanged
   });
 });
 
@@ -197,6 +225,8 @@ describe("loadCurrentConfig", () => {
       "escrowTimeoutMs",
       "minReputationScore",
       "maxPriceDeviation",
+      "reservePriceMultiplier",
+      "minBidders",
     ];
 
     for (const key of requiredKeys) {
@@ -212,6 +242,10 @@ describe("loadCurrentConfig", () => {
     expect(config.minReputationScore).toBeLessThanOrEqual(1);
     expect(config.maxPriceDeviation).toBeGreaterThanOrEqual(0.05);
     expect(config.maxPriceDeviation).toBeLessThanOrEqual(0.95);
+    expect(config.reservePriceMultiplier).toBeGreaterThanOrEqual(0.5);
+    expect(config.reservePriceMultiplier).toBeLessThanOrEqual(2.0);
+    expect(config.minBidders).toBeGreaterThanOrEqual(1);
+    expect(config.minBidders).toBeLessThanOrEqual(5);
   });
 
   it("falls back to DEFAULT_PROTOCOL_CONFIG shape when given a corrupt JSON string", () => {

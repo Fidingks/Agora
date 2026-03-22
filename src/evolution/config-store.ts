@@ -79,7 +79,12 @@ export function loadCurrentConfig(): ProtocolConfig {
       ];
       const allPresent = required.every((k) => typeof cfg[k] === "number");
       if (allPresent) {
-        return cfg as unknown as ProtocolConfig;
+        // Back-fill new fields that may be absent in older persisted configs.
+        const loaded = cfg as unknown as ProtocolConfig;
+        return {
+          ...DEFAULT_PROTOCOL_CONFIG,
+          ...loaded,
+        };
       }
     }
 

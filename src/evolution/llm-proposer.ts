@@ -39,6 +39,8 @@ const ProtocolConfigKeySchema = z.enum([
   "escrowTimeoutMs",
   "minReputationScore",
   "maxPriceDeviation",
+  "reservePriceMultiplier",
+  "minBidders",
 ]);
 
 const LLMProposalSchema = z.object({
@@ -102,10 +104,12 @@ function buildSystemPrompt(
     recentHistory,
     "",
     "## Parameter Safe Bounds",
-    "  maxNegotiationRounds : [1, 20]",
-    "  escrowTimeoutMs      : [1000, 120000]",
-    "  minReputationScore   : [0, 1]",
-    "  maxPriceDeviation    : [0.05, 0.95]",
+    "  maxNegotiationRounds   : [1, 20]",
+    "  escrowTimeoutMs        : [1000, 120000]",
+    "  minReputationScore     : [0, 1]",
+    "  maxPriceDeviation      : [0.05, 0.95]",
+    "  reservePriceMultiplier : [0.5, 2.0]   (auction scenarios)",
+    "  minBidders             : [1, 5]       (auction scenarios)",
     "",
     "## Instructions",
     "1. Analyse the metrics and identify the weakest signal.",

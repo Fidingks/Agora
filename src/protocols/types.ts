@@ -42,6 +42,20 @@ export interface ProtocolConfig {
    * Default: 0.3
    */
   readonly maxPriceDeviation: number;
+
+  /**
+   * Multiplier applied to the base reserve price in auction scenarios.
+   * e.g. 1.2 means the effective reserve is 120 % of the base reserve.
+   * Default: 1.0
+   */
+  readonly reservePriceMultiplier: number;
+
+  /**
+   * Minimum number of bidders required for an auction to proceed.
+   * If fewer bidders are present, the auction is cancelled.
+   * Default: 2
+   */
+  readonly minBidders: number;
 }
 
 export const DEFAULT_PROTOCOL_CONFIG: ProtocolConfig = {
@@ -49,6 +63,8 @@ export const DEFAULT_PROTOCOL_CONFIG: ProtocolConfig = {
   escrowTimeoutMs: 30_000,
   minReputationScore: 0,
   maxPriceDeviation: 0.3,
+  reservePriceMultiplier: 1.0,
+  minBidders: 2,
 };
 
 // ---------------------------------------------------------------------------

@@ -145,6 +145,91 @@ export function generateMockProposal(
 }
 
 // ---------------------------------------------------------------------------
+// Auction-specific mock proposal generator
+//
+// Priority order:
+//   1. If successRate is critically low → lower reservePriceMultiplier
+//   2. If successRate is low → reduce minBidders to allow smaller auctions
+//   3. If successRate is good and duration is high → raise reservePriceMultiplier
+//      to filter weak bidders and speed up resolution
+//   4. Otherwise → explore raising minBidders for more competitive auctions
+// ---------------------------------------------------------------------------
+
+/**
+ * Generate a heuristic proposal targeting auction-specific parameters.
+ *
+ * Same determinism contract as generateMockProposal — given the same config
+ * and metrics, always returns the same proposal.
+ */
+export function generateAuctionMockProposal(
+  config: ProtocolConfig,
+  lastMetrics: ProtocolMetrics
+): ProtocolProposal {
+  const { successRate, avgDurationMs } = lastMetrics;
+
+  // Case 1: critically low success — reserve price may be too high, scaring
+  // away bidders. Lower the multiplier so more bids clear the reserve.
+  if (successRate < 0.5) {
+    const proposedValue = clamp(
+      parseFloat((config.reservePriceMultiplier - 0.15).toFixed(2)),
+      "reservePriceMultiplier"
+    );
+    return {
+      parameterName: "reservePriceMultiplier",
+      currentValue: config.reservePriceMultiplier,
+      proposedValue,
+      rationale:
+        `successRate ${successRate.toFixed(2)} is critically low in auction mode; lowering ` +
+        `reservePriceMultiplier by 0.15 to reduce effective reserve and attract more valid bids.`,
+    };
+  }
+
+  // Case 2: low but recoverable success — might need fewer required bidders
+  // so auctions with thin participation can still proceed.
+  if (successRate < 0.8 && config.minBidders > 1) {
+    const proposedValue = clamp(config.minBidders - 1, "minBidders");
+    return {
+      parameterName: "minBidders",
+      currentValue: config.minBidders,
+      proposedValue,
+      rationale:
+        `successRate ${successRate.toFixed(2)} is below 0.80; reducing minBidders from ` +
+        `${config.minBidders} to ${proposedValue} so auctions with fewer participants can still proceed.`,
+    };
+  }
+
+  // Case 3: good success but slow — raising the reserve filters out marginal
+  // bidders, reducing the number of bids to process and speeding resolution.
+  const HIGH_DURATION_THRESHOLD_MS = 50;
+  if (avgDurationMs > HIGH_DURATION_THRESHOLD_MS) {
+    const proposedValue = clamp(
+      parseFloat((config.reservePriceMultiplier + 0.1).toFixed(2)),
+      "reservePriceMultiplier"
+    );
+    return {
+      parameterName: "reservePriceMultiplier",
+      currentValue: config.reservePriceMultiplier,
+      proposedValue,
+      rationale:
+        `successRate is good (${successRate.toFixed(2)}) but avgDurationMs ${avgDurationMs.toFixed(1)} ` +
+        `exceeds ${HIGH_DURATION_THRESHOLD_MS}ms; raising reservePriceMultiplier to filter weak bidders.`,
+    };
+  }
+
+  // Case 4: healthy metrics — explore whether requiring more bidders
+  // increases competition and produces better prices.
+  const proposedValue = clamp(config.minBidders + 1, "minBidders");
+  return {
+    parameterName: "minBidders",
+    currentValue: config.minBidders,
+    proposedValue,
+    rationale:
+      `Auction metrics look healthy (successRate=${successRate.toFixed(2)}, avgDurationMs=${avgDurationMs.toFixed(1)}ms); ` +
+      `probing whether requiring ${proposedValue} bidders improves competition and final prices.`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Utility: apply a proposal to a config snapshot (for logging / dry-run)
 // ---------------------------------------------------------------------------
 
