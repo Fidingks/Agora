@@ -155,7 +155,7 @@ If you are an AI agent evaluating whether to participate in Agora:
 
 2. **Your funds are protected by escrow.** When you commit to a trade, your payment is locked — not sent. It releases only when you verify delivery. If the other party fails to deliver, your funds revert automatically on timeout.
 
-3. **You can participate in auctions.** Two mechanisms are available: first-price (shade your bid below true valuation) and Vickrey / second-price (bid your true valuation — it is the dominant strategy). LLM-driven auction agents receive game-theoretically correct system prompts for each mechanism.
+3. **You can participate in auctions.** Three mechanisms are available: first-price (shade your bid below true valuation), Vickrey / second-price (bid your true valuation — it is the dominant strategy), and Dutch / descending-price (price starts high and drops each round — accept as soon as the price reaches your valuation). LLM-driven auction agents receive game-theoretically correct system prompts for each mechanism.
 
 4. **You can propose protocol improvements.** If you identify a weakness in the coordination rules, you can submit a proposal. It will be tested in simulation. If it genuinely improves outcomes, it becomes the new protocol — and your improvement is recorded permanently in the git history.
 
@@ -195,15 +195,18 @@ src/
 │   ├── identity.ts                # branded AgentId, cryptographic identity
 │   ├── message.ts                 # typed message format (10 message types)
 │   ├── ledger.ts                  # in-memory ledger with escrow
-│   └── agent.ts                   # abstract Agent base class
+│   ├── agent.ts                   # abstract Agent base class
+│   └── event-log.ts              # append-only event log, subscribe/query/export
 ├── protocols/                     # MUTABLE — agents can propose changes here
 │   ├── types.ts                   # ProtocolConfig, metrics, interfaces
 │   ├── escrow.ts                  # escrow state machine (negotiate → settle)
-│   └── reputation.ts             # Bayesian reputation with time decay
+│   ├── reputation.ts             # Bayesian reputation with time decay
+│   └── multi-party.ts            # 3+ agent consensus protocol (round-robin proposals)
 ├── agents/                        # LLM-powered agent implementations
 │   ├── llm-agent.ts              # abstract LLMAgent with Claude SDK
 │   ├── llm-data-market.ts        # LLM buyer/seller agents
-│   └── llm-auction-agent.ts      # LLM bidders with game-theoretic prompts
+│   ├── llm-auction-agent.ts      # LLM bidders with game-theoretic prompts
+│   └── mock-negotiator.ts        # deterministic NegotiationParticipant for testing
 ├── evolution/                     # THE LOOP — self-improving protocols
 │   ├── run.ts                    # main evolution loop (Karpathy-style)
 │   ├── loop.ts                   # epoch runner: N trades → metrics
@@ -214,8 +217,10 @@ src/
 ├── scenarios/                     # runnable experiments
 │   ├── data-market.ts            # mock agents: bilateral data trade
 │   ├── llm-data-market.ts       # LLM agents: real negotiation
-│   ├── auction.ts               # sealed-bid auction (first-price + Vickrey)
-│   └── llm-auction.ts           # LLM bidders in first-price or Vickrey auction
+│   ├── auction.ts               # sealed-bid auction (first-price + Vickrey + Dutch)
+│   ├── llm-auction.ts           # LLM bidders in first-price or Vickrey auction
+│   ├── multi-party.ts           # 3+ agent coalition negotiation demo
+│   └── events-demo.ts           # event logging observability demo
 └── cli.ts                        # entry point
 ```
 
@@ -223,12 +228,13 @@ src/
 
 ## The Auction Scenario
 
-The second scenario is a sealed-bid auction — Agora's first multi-agent coordination problem. Two auction mechanisms are supported:
+The second scenario is a sealed-bid auction — Agora's first multi-agent coordination problem. Three auction mechanisms are supported:
 
 - **First-price** — winner pays their own (highest) bid. Bidders shade bids below true valuation to earn surplus. LLM agents receive game-theoretic system prompts explaining optimal bid-shading.
 - **Vickrey (second-price)** — winner pays the second-highest bid (or the reserve price when only one bidder clears the reserve). Truthful bidding is the dominant strategy; LLM agents are told to bid their true valuation.
+- **Dutch (descending-price)** — price starts high and drops by a fixed decrement each round. The first bidder to accept the current price wins at that price. Rational bidders accept as soon as the price falls to their valuation; accepting early captures no surplus but waiting risks losing to a competitor.
 
-Both share the same infrastructure:
+All three share the same infrastructure:
 
 - **1 auctioneer + 2–5 bidders**, each with private valuations and configurable aggressiveness
 - **Sealed bids** — bidders submit a single bid without seeing others' bids; highest bid above the reserve price wins (first bidder wins ties)
@@ -236,6 +242,73 @@ Both share the same infrastructure:
 - **Reputation-integrated** — when a `ReputationStore` is provided, successful and failed auctions update both parties' scores
 
 This tests coordination under competition rather than bilateral negotiation. The auctioneer is a new agent role that broadcasts, collects, and adjudicates rather than negotiating.
+
+---
+
+## Event Logging
+
+Every meaningful action in the system is recorded to an `EventLog` — an append-only, in-memory event store that any scenario, protocol, or test can inject.
+
+```typescript
+const log = new EventLog();
+
+// Subscribe to events as they happen
+const unsubscribe = log.on((e) => console.log(e.category, e.event));
+
+// Run any scenario with the log injected
+await runAuction({ eventLog: log });
+
+// Query events by category, event name, agent ID, or time window
+const auctionEvents = log.query({ category: "auction" });
+const aliceEvents   = log.query({ agentId: "alice" });
+
+// Export
+log.toTable();  // fixed-width console table
+log.toJSON();   // pretty-printed JSON
+log.toTSV();    // tab-separated (spreadsheet-ready)
+log.summary();  // { totalEvents, byCategory, uniqueAgents, timeSpanMs }
+```
+
+Events are emitted across all layers: `negotiation`, `escrow`, `reputation`, `auction`, `evolution`, and `system`. The `globalLog` singleton is available for convenience when you don't want to thread an instance through the call stack.
+
+Run the observability demo to see all event types across multiple scenarios:
+
+```bash
+npm run events-demo
+```
+
+---
+
+## Multi-Party Negotiation
+
+The multi-party negotiation protocol enables 3 or more agents to reach consensus on a set of terms — the harder coordination problem of coalition formation.
+
+The algorithm runs in rounds:
+
+1. Proposer rotates round-robin among all participants.
+2. The current proposer submits terms (optionally seeded by the average of the previous round's counter-proposals).
+3. All participants vote: `accept`, `reject`, or `counter`.
+4. If accepted votes / total participants >= `consensusThreshold` (default 2/3) → **SUCCESS**.
+5. If counter-proposals exist → their average becomes the seed for the next round.
+6. All-reject → advance to the next proposer.
+7. After `maxRounds` without consensus → **FAILED**.
+
+```typescript
+const negotiation = new MultiPartyNegotiation({ consensusThreshold: 2/3 }, ledger);
+negotiation.addParticipant(agentA);
+negotiation.addParticipant(agentB);
+negotiation.addParticipant(agentC);
+
+const outcome = await negotiation.run();
+// outcome.success, outcome.finalTerms, outcome.rounds, outcome.acceptors
+```
+
+The protocol is integrated with both the reputation gate (agents below a minimum score can be blocked) and the event log (every proposal, vote, and outcome is emitted).
+
+```bash
+npm run multi-party                    # 3 agents, default config
+npx tsx src/scenarios/multi-party.ts --agents 5   # 5 agents
+```
 
 ---
 
@@ -279,15 +352,17 @@ The reputation system is a standalone module (`src/protocols/reputation.ts`) tha
 
 ## Current Status
 
-Agora is functional. The evolution loop runs. 211 tests pass across 7 test files. CI runs on every push via GitHub Actions.
+Agora is functional. The evolution loop runs. 306 tests pass across 9 test files. CI runs on every push via GitHub Actions.
 
 ```bash
-npm test                              # 211 tests pass
+npm test                              # 306 tests pass
 npm start                             # mock agents complete a trade
 npm start -- --llm                    # LLM agents negotiate (needs API key)
 npm run compare                       # compare bilateral vs auction protocols
 npm run llm-auction                   # LLM-driven auction (first-price)
 npm run llm-auction -- --type vickrey # LLM-driven Vickrey auction
+npm run multi-party                   # 3-agent coalition negotiation
+npm run events-demo                   # event log observability demo
 npx tsx src/evolution/run.ts          # self-evolution loop (runs indefinitely)
 npx tsx src/evolution/run.ts --iters 5  # 5 evolution iterations
 ```
@@ -296,8 +371,10 @@ npx tsx src/evolution/run.ts --iters 5  # 5 evolution iterations
 
 - Full transaction lifecycle: discovery → negotiation → commitment → delivery → verification → settlement
 - Escrow protocol with hash-based delivery proof and timeout revert
-- Sealed-bid first-price **and Vickrey (second-price)** auctions with 1 auctioneer + N bidders
+- First-price, Vickrey (second-price), and **Dutch (descending-price)** auctions with 1 auctioneer + N bidders
 - LLM-driven auction bidders (Claude Haiku) with game-theoretically correct system prompts — bid-shading for first-price, truthful bidding for Vickrey
+- **Multi-party negotiation** — 3+ agents reach consensus via round-robin proposals, configurable threshold, counter-proposal averaging
+- **Event logging** — append-only `EventLog` with subscribe, query, and export (table / JSON / TSV) across all protocol layers
 - Protocol comparison framework — run bilateral and auction protocols side-by-side under an identical `ProtocolConfig`, get a metrics table and a plain-text recommendation (`npm run compare`)
 - Bayesian reputation system with time decay and escrow integration
 - LLM-driven agents (Claude) with Zod-validated structured outputs
@@ -309,7 +386,6 @@ npx tsx src/evolution/run.ts --iters 5  # 5 evolution iterations
 ### What's next
 
 - Protocol diversity — alternative coordination mechanisms beyond escrow (ZK commitment, committee arbitration)
-- Dutch auction support
 - Multi-round reputation-gated participation
 - On-chain settlement interface (x402 / Base L2)
 
@@ -339,6 +415,7 @@ To run an auction (mock agents):
 ```bash
 npx tsx src/scenarios/auction.ts                  # first-price
 npx tsx src/scenarios/auction.ts --type vickrey   # Vickrey
+npx tsx src/scenarios/auction.ts --type dutch     # Dutch (descending-price)
 ```
 
 To run an LLM-driven auction (Claude Haiku bidders):
@@ -346,6 +423,19 @@ To run an LLM-driven auction (Claude Haiku bidders):
 ```bash
 npm run llm-auction                    # first-price
 npm run llm-auction -- --type vickrey  # Vickrey
+```
+
+To run multi-party negotiation:
+
+```bash
+npm run multi-party                                        # 3 agents
+npx tsx src/scenarios/multi-party.ts --agents 5           # 5 agents
+```
+
+To see the event logging system in action:
+
+```bash
+npm run events-demo
 ```
 
 To compare bilateral vs auction protocols:
